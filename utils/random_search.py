@@ -25,6 +25,7 @@ from .tag import (
     process_and_send_illusts,
 )
 from .pixiv_utils import send_pixiv_image, send_forward_message
+from .random_schedule import normalize_schedule_time
 
 
 class RandomSearchService:
@@ -96,6 +97,25 @@ class RandomSearchService:
         self._queue_processor_task = None
         self.is_queue_processor_running = False
 
+    def _normalize_schedule_time(self, candidate: datetime) -> datetime:
+        return normalize_schedule_time(
+            candidate,
+            getattr(self.pixiv_config, "random_search_quiet_start", "00:00"),
+            getattr(self.pixiv_config, "random_search_quiet_end", "08:00"),
+            enabled=getattr(
+                self.pixiv_config, "random_search_quiet_hours_enabled", False
+            ),
+        )
+
+    def _set_schedule_time(self, chat_id: str, candidate: datetime, reason: str):
+        normalized = self._normalize_schedule_time(candidate)
+        set_schedule_time(chat_id, normalized)
+        if normalized != candidate:
+            logger.info(
+                f"群组 {chat_id}: {reason}处于随机搜索静默时段，已调整到 {normalized}"
+            )
+        return normalized
+
     async def _scheduler_tick(self):
         """
         检查是否有群组需要执行搜索，并将其加入队列。
@@ -145,14 +165,23 @@ class RandomSearchService:
 
                     delay_minutes = random.randint(min_interval, max_interval)
                     next_execution_time = now + timedelta(minutes=delay_minutes)
-                    set_schedule_time(chat_id, next_execution_time)
+                    scheduled_time = self._set_schedule_time(
+                        chat_id, next_execution_time, "首次调度时间"
+                    )
                     logger.info(
-                        f"群组 {chat_id}: 首次调度随机搜索，将在 {delay_minutes} 分钟后执行"
+                        f"群组 {chat_id}: 首次调度随机搜索，将在 {scheduled_time} 执行"
                     )
                     continue
 
                 # 检查是否到了运行时间且当前没有执行任务
                 if now >= next_execution_time and not self.execution_locks[chat_id]:
+                    next_allowed_time = self._normalize_schedule_time(now)
+                    if next_allowed_time != now:
+                        set_schedule_time(chat_id, next_allowed_time)
+                        logger.info(
+                            f"群组 {chat_id}: 当前处于随机搜索静默时段，推迟到 {next_allowed_time}"
+                        )
+                        continue
                     pending_groups.append(chat_id)
 
             # 将所有待执行的群组加入队列
@@ -202,9 +231,11 @@ class RandomSearchService:
 
                             next_interval = random.randint(min_interval, max_interval)
                             new_execution_time = now + timedelta(minutes=next_interval)
-                            set_schedule_time(chat_id, new_execution_time)
+                            scheduled_time = self._set_schedule_time(
+                                chat_id, new_execution_time, "下次调度时间"
+                            )
                             logger.info(
-                                f"群组 {chat_id}: 随机搜索已执行。下次运行在 {next_interval} 分钟后。"
+                                f"群组 {chat_id}: 随机搜索已执行。下次运行时间为 {scheduled_time}。"
                             )
 
                         except Exception as e:

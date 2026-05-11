@@ -133,6 +133,15 @@ class PixivConfig:
         self.random_search_max_interval = self.config.get(
             "random_search_max_interval", 120
         )
+        self.random_search_quiet_hours_enabled = self.config.get(
+            "random_search_quiet_hours_enabled", False
+        )
+        self.random_search_quiet_start = self.config.get(
+            "random_search_quiet_start", "00:00"
+        )
+        self.random_search_quiet_end = self.config.get(
+            "random_search_quiet_end", "08:00"
+        )
         self.random_sent_illust_retention_days = self.config.get(
             "random_sent_illust_retention_days", 7
         )
@@ -179,6 +188,8 @@ class PixivConfig:
             f"subscription_enabled={self.subscription_enabled}, "
             f"subscription_force_forward={self.subscription_force_forward}, "
             f"proxy='{effective_proxy or '未使用'}', "
+            f"random_search_quiet_hours_enabled={self.random_search_quiet_hours_enabled}, "
+            f"random_search_quiet_hours='{self.random_search_quiet_start}-{self.random_search_quiet_end}', "
             f"fanbox_sessid={'已设置' if self.fanbox_sessid else '未设置'}, "
             f"fanbox_cookie={'已设置' if self.fanbox_cookie else '未设置'}, "
             f"fanbox_user_agent={'已设置' if self.fanbox_user_agent else '未设置'}, "
@@ -255,6 +266,9 @@ class PixivConfigManager:
             },
             "random_search_min_interval": {"type": "int", "min": 1, "max": 1440},
             "random_search_max_interval": {"type": "int", "min": 1, "max": 1440},
+            "random_search_quiet_hours_enabled": {"type": "bool"},
+            "random_search_quiet_start": {"type": "string"},
+            "random_search_quiet_end": {"type": "string"},
             "proxy": {"type": "string", "hidden": True},
             "fanbox_sessid": {"type": "string", "hidden": True},
             "fanbox_cookie": {"type": "string", "hidden": True},
@@ -297,6 +311,9 @@ class PixivConfigManager:
             "fanbox_user_agent",
             "random_search_min_interval",
             "random_search_max_interval",
+            "random_search_quiet_hours_enabled",
+            "random_search_quiet_start",
+            "random_search_quiet_end",
             "random_sent_illust_retention_days",
         ]
 
@@ -360,6 +377,13 @@ class PixivConfigManager:
                 except ValueError:
                     return False, f"配置项 {key} 的值 '{value}' 不是有效的整数。"
             elif typ == "string":
+                if key in {"random_search_quiet_start", "random_search_quiet_end"}:
+                    try:
+                        from .random_schedule import parse_time_of_day
+
+                        parse_time_of_day(value)
+                    except ValueError:
+                        return False, f"配置项 {key} 必须使用 HH:MM 格式，例如 00:00 或 08:30。"
                 setattr(self.config, key, value)
 
             self.config.save_config()

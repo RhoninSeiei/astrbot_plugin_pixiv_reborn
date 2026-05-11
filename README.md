@@ -220,6 +220,9 @@
 /pixiv_config min_bookmarks 500
 /pixiv_config min_views 5000
 /pixiv_config random_search_min_interval 30
+/pixiv_config random_search_quiet_hours_enabled true
+/pixiv_config random_search_quiet_start 00:00
+/pixiv_config random_search_quiet_end 08:00
 ```
 
 ## ⚙️ 配置选项
@@ -257,6 +260,9 @@
 | `use_image_proxy` | 是否启用图片反代服务器（`url` 发送模式建议开启） | true |
 | `random_search_min_interval` | 随机搜索最短间隔（分钟） | 60 |
 | `random_search_max_interval` | 随机搜索最长间隔（分钟） | 120 |
+| `random_search_quiet_hours_enabled` | 是否启用随机搜索静默时段，仅影响随机标签和随机排行榜 | false |
+| `random_search_quiet_start` | 随机搜索静默时段开始时间，格式 `HH:MM` | 00:00 |
+| `random_search_quiet_end` | 随机搜索静默时段结束时间，格式 `HH:MM` | 08:00 |
 | `random_sent_illust_retention_days` | 已发送作品保留天数 | 7 |
 
 ## 🔧 故障排除

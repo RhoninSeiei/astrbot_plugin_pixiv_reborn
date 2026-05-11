@@ -86,6 +86,7 @@
           "field_only",
           "tag_only"
       ]
+  },
   "min_bookmarks": {
       "description": "最小书签数过滤阈值",
       "type": "int",
@@ -248,6 +249,24 @@
       "default": 120,
       "min": 1,
       "max": 1440
+  },
+  "random_search_quiet_hours_enabled": {
+      "description": "是否启用随机搜索静默时段",
+      "type": "bool",
+      "hint": "启用后，随机标签和随机排行榜推送会避开指定时间段；画师订阅不受该配置影响。",
+      "default": false
+  },
+  "random_search_quiet_start": {
+      "description": "随机搜索静默时段开始时间",
+      "type": "string",
+      "hint": "格式 HH:MM，例如 00:00。可与结束时间组成跨午夜时段。",
+      "default": "00:00"
+  },
+  "random_search_quiet_end": {
+      "description": "随机搜索静默时段结束时间",
+      "type": "string",
+      "hint": "格式 HH:MM，例如 08:00。到达结束时间后恢复随机标签和随机排行榜推送。",
+      "default": "08:00"
   },
   "random_sent_illust_retention_days": {
       "description": "随机搜索已发送作品保留天数,以避免重复发送",
