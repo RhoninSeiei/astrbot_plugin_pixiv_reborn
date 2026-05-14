@@ -17,6 +17,7 @@ from .database import (
     get_all_schedule_times,
     get_all_random_ranking_groups,
     get_random_rankings,
+    get_random_search_group_config,
 )
 from .tag import (
     build_detail_message,
@@ -26,6 +27,7 @@ from .tag import (
 )
 from .pixiv_utils import send_pixiv_image, send_forward_message
 from .random_schedule import normalize_schedule_time
+from .random_group_config import resolve_random_search_runtime_config
 
 
 class RandomSearchService:
@@ -116,6 +118,15 @@ class RandomSearchService:
             )
         return normalized
 
+    def _resolve_group_runtime_config(self, chat_id: str):
+        return resolve_random_search_runtime_config(
+            self.pixiv_config, get_random_search_group_config(chat_id)
+        )
+
+    def _get_group_interval_range(self, chat_id: str):
+        group_config = self._resolve_group_runtime_config(chat_id)
+        return group_config.min_interval_minutes, group_config.max_interval_minutes
+
     async def _scheduler_tick(self):
         """
         检查是否有群组需要执行搜索，并将其加入队列。
@@ -157,11 +168,9 @@ class RandomSearchService:
                 # 如果是第一次看到这个群组，立即或稍后调度
                 if next_execution_time is None:
                     # 初始延迟，避免同时启动，使用用户配置的间隔范围
-                    min_interval = self.pixiv_config.random_search_min_interval
-                    max_interval = self.pixiv_config.random_search_max_interval
-                    # 基本验证确保 max >= min
-                    if max_interval < min_interval:
-                        max_interval = min_interval
+                    min_interval, max_interval = self._get_group_interval_range(
+                        chat_id
+                    )
 
                     delay_minutes = random.randint(min_interval, max_interval)
                     next_execution_time = now + timedelta(minutes=delay_minutes)
@@ -223,11 +232,9 @@ class RandomSearchService:
 
                             # 调度下次运行
                             now = datetime.now()
-                            min_interval = self.pixiv_config.random_search_min_interval
-                            max_interval = self.pixiv_config.random_search_max_interval
-                            # 基本验证确保 max >= min
-                            if max_interval < min_interval:
-                                max_interval = min_interval
+                            min_interval, max_interval = (
+                                self._get_group_interval_range(chat_id)
+                            )
 
                             next_interval = random.randint(min_interval, max_interval)
                             new_execution_time = now + timedelta(minutes=next_interval)
@@ -388,19 +395,21 @@ class RandomSearchService:
                 return
 
             # 发送配置
+            group_config = self._resolve_group_runtime_config(chat_id)
             config = FilterConfig(
                 r18_mode=self.pixiv_config.r18_mode,
                 filter_r18g_only=self.pixiv_config.filter_r18g_only,
                 ai_filter_mode=self.pixiv_config.ai_filter_mode,
                 ai_detection_mode=self.pixiv_config.ai_detection_mode,
                 display_tag_str=f"随机:{display_tags}",
-                return_count=self.pixiv_config.return_count,
+                return_count=group_config.return_count,
                 logger=logger,
                 show_filter_result=self.pixiv_config.show_filter_result,
                 single_response_mode=self.pixiv_config.single_response_mode,
                 excluded_tags=exclude_tags or [],
                 forward_threshold=self.pixiv_config.forward_threshold,
                 show_details=self.pixiv_config.show_details,
+                min_likes=group_config.min_likes,
             )
 
             # 创建模拟事件以捕获输出
@@ -524,19 +533,21 @@ class RandomSearchService:
                 logger.info(f"排行榜 {mode} 的随机搜索过滤后无可用作品。")
                 return
 
+            group_config = self._resolve_group_runtime_config(chat_id)
             config = FilterConfig(
                 r18_mode=self.pixiv_config.r18_mode,
                 filter_r18g_only=self.pixiv_config.filter_r18g_only,
                 ai_filter_mode=self.pixiv_config.ai_filter_mode,
                 ai_detection_mode=self.pixiv_config.ai_detection_mode,
                 display_tag_str=f"随机排行榜:{mode}",
-                return_count=self.pixiv_config.return_count,
+                return_count=group_config.return_count,
                 logger=logger,
                 show_filter_result=self.pixiv_config.show_filter_result,
                 single_response_mode=self.pixiv_config.single_response_mode,
                 excluded_tags=[],
                 forward_threshold=self.pixiv_config.forward_threshold,
                 show_details=self.pixiv_config.show_details,
+                min_likes=group_config.min_likes,
             )
 
             class MockEvent:
@@ -613,11 +624,7 @@ class RandomSearchService:
         try:
             # 重新设置调度时间，使用用户配置的间隔范围
             now = datetime.now()
-            min_interval = self.pixiv_config.random_search_min_interval
-            max_interval = self.pixiv_config.random_search_max_interval
-            # 基本验证确保 max >= min
-            if max_interval < min_interval:
-                max_interval = min_interval
+            min_interval, max_interval = self._get_group_interval_range(chat_id)
 
             # 恢复时使用较短的延迟，但仍在用户配置范围内
             delay_minutes = random.randint(min_interval, max_interval)

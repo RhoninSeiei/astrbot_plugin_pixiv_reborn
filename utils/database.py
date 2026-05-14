@@ -77,6 +77,16 @@ class RandomSearchSchedule(BaseModel):
         primary_key = pw.CompositeKey("chat_id")
 
 
+class RandomSearchGroupConfig(BaseModel):
+    """随机搜索按群覆盖配置"""
+
+    chat_id = pw.CharField(primary_key=True)
+    return_count = pw.IntegerField(null=True)
+    min_likes = pw.IntegerField(null=True)
+    min_interval_minutes = pw.IntegerField(null=True)
+    max_interval_minutes = pw.IntegerField(null=True)
+
+
 def _coerce_schedule_time(value, chat_id: str = ""):
     """将数据库中的调度时间统一转换为 datetime。"""
     if value is None:
@@ -163,6 +173,12 @@ def initialize_database():
         if not RandomSearchSchedule.table_exists():
             db.create_tables([RandomSearchSchedule])
             logger.info("数据库初始化成功，数据表 random_search_schedule 已创建。")
+
+        if not RandomSearchGroupConfig.table_exists():
+            db.create_tables([RandomSearchGroupConfig])
+            logger.info(
+                "数据库初始化成功，数据表 random_search_group_config 已创建。"
+            )
 
         if not RandomRankingConfig.table_exists():
             db.create_tables([RandomRankingConfig])
@@ -413,6 +429,53 @@ def get_random_search_status(chat_id: str) -> (bool, bool):
     except Exception as e:
         logger.error(f"获取随机搜索状态失败: {e}")
         return False, False
+
+
+def get_random_search_group_config(chat_id: str):
+    """获取指定群聊的随机搜索覆盖配置。"""
+    try:
+        return RandomSearchGroupConfig.get_or_none(
+            RandomSearchGroupConfig.chat_id == chat_id
+        )
+    except Exception as e:
+        logger.error(f"获取随机搜索群配置失败: {e}")
+        return None
+
+
+def upsert_random_search_group_config(
+    chat_id: str,
+    *,
+    return_count=None,
+    min_likes=None,
+    min_interval_minutes=None,
+    max_interval_minutes=None,
+):
+    """新增或更新指定群聊的随机搜索覆盖配置。"""
+    values = {
+        "return_count": return_count,
+        "min_likes": min_likes,
+        "min_interval_minutes": min_interval_minutes,
+        "max_interval_minutes": max_interval_minutes,
+    }
+    try:
+        with db.atomic():
+            config, created = RandomSearchGroupConfig.get_or_create(
+                chat_id=chat_id,
+                defaults=values,
+            )
+            if not created:
+                (
+                    RandomSearchGroupConfig.update(**values)
+                    .where(RandomSearchGroupConfig.chat_id == chat_id)
+                    .execute()
+                )
+                config = RandomSearchGroupConfig.get(
+                    RandomSearchGroupConfig.chat_id == chat_id
+                )
+            return config
+    except Exception as e:
+        logger.error(f"保存随机搜索群配置失败: {e}")
+        return None
 
 
 def add_sent_illust(illust_id: int, chat_id: str):
