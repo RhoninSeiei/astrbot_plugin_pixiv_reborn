@@ -372,6 +372,46 @@ async def _build_image_from_bytes(img_data: bytes, ext: str = ".jpg") -> Image:
         return Image.fromBytes(img_data)
 
 
+def _extract_pixiv_temp_paths(message_content) -> list[Path]:
+    """从消息链中提取本插件生成的临时图片路径。"""
+    if not _temp_dir or not message_content:
+        return []
+
+    temp_root = Path(_temp_dir).resolve()
+    chain = getattr(message_content, "chain", None)
+    if chain is None:
+        chain = message_content if isinstance(message_content, list) else []
+
+    paths = []
+    for component in chain:
+        raw_path = getattr(component, "path", None)
+        if not raw_path:
+            continue
+        try:
+            candidate = Path(raw_path).resolve()
+            candidate.relative_to(temp_root)
+        except Exception:
+            continue
+        if candidate.is_file() and candidate.name.startswith("pixiv_"):
+            paths.append(candidate)
+    return paths
+
+
+async def cleanup_pixiv_temp_files(message_content) -> int:
+    """删除 file 模式为单条消息生成的临时图片文件。"""
+    removed = 0
+    for path in dict.fromkeys(_extract_pixiv_temp_paths(message_content)):
+        try:
+            await asyncio.to_thread(path.unlink)
+            removed += 1
+            logger.debug(f"Pixiv 插件：已清理临时图片文件 - {path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Pixiv 插件：清理临时图片文件失败 - {path}: {e}")
+    return removed
+
+
 async def download_image(
     session: aiohttp.ClientSession, url: str, headers: dict = None
 ) -> Optional[bytes]:

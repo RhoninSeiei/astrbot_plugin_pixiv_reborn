@@ -87,6 +87,20 @@ class RandomSearchGroupConfig(BaseModel):
     max_interval_minutes = pw.IntegerField(null=True)
 
 
+class RandomSearchSendAttempt(BaseModel):
+    """随机搜索发送尝试记录。"""
+
+    id = pw.AutoField()
+    chat_id = pw.CharField()
+    session_id = pw.TextField()
+    source_type = pw.CharField()
+    source_name = pw.CharField(null=True)
+    illust_id = pw.BigIntegerField(null=True)
+    success = pw.BooleanField(default=False)
+    error_message = pw.TextField(null=True)
+    created_at = pw.DateTimeField(default=datetime.now)
+
+
 def _coerce_schedule_time(value, chat_id: str = ""):
     """将数据库中的调度时间统一转换为 datetime。"""
     if value is None:
@@ -178,6 +192,12 @@ def initialize_database():
             db.create_tables([RandomSearchGroupConfig])
             logger.info(
                 "数据库初始化成功，数据表 random_search_group_config 已创建。"
+            )
+
+        if not RandomSearchSendAttempt.table_exists():
+            db.create_tables([RandomSearchSendAttempt])
+            logger.info(
+                "数据库初始化成功，数据表 random_search_send_attempt 已创建。"
             )
 
         if not RandomRankingConfig.table_exists():
@@ -490,6 +510,35 @@ def add_sent_illust(illust_id: int, chat_id: str):
         pass
     except Exception as e:
         logger.error(f"添加已发送作品记录失败: {e}")
+
+
+def add_random_search_send_attempt(
+    chat_id: str,
+    session_id: str,
+    source_type: str,
+    source_name: str = None,
+    illust_id: int = None,
+    success: bool = False,
+    error_message: str = None,
+):
+    """记录随机搜索发送尝试。"""
+    try:
+        message = None
+        if error_message:
+            message = str(error_message)[:4000]
+        with db.atomic():
+            RandomSearchSendAttempt.create(
+                chat_id=chat_id,
+                session_id=session_id,
+                source_type=source_type,
+                source_name=source_name,
+                illust_id=illust_id,
+                success=success,
+                error_message=message,
+                created_at=datetime.now(),
+            )
+    except Exception as e:
+        logger.error(f"添加随机搜索发送尝试记录失败: {e}")
 
 
 def is_illust_sent(illust_id: int, chat_id: str) -> bool:

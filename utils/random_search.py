@@ -18,6 +18,7 @@ from .database import (
     get_all_random_ranking_groups,
     get_random_rankings,
     get_random_search_group_config,
+    add_random_search_send_attempt,
 )
 from .tag import (
     build_detail_message,
@@ -25,7 +26,7 @@ from .tag import (
     validate_and_process_tags,
     process_and_send_illusts,
 )
-from .pixiv_utils import send_pixiv_image, send_forward_message
+from .pixiv_utils import send_pixiv_image, send_forward_message, cleanup_pixiv_temp_files
 from .random_schedule import normalize_schedule_time
 from .random_group_config import resolve_random_search_runtime_config
 
@@ -126,6 +127,62 @@ class RandomSearchService:
     def _get_group_interval_range(self, chat_id: str):
         group_config = self._resolve_group_runtime_config(chat_id)
         return group_config.min_interval_minutes, group_config.max_interval_minutes
+
+    async def _send_message_with_attempt_record(
+        self,
+        chat_id: str,
+        session_id: str,
+        source_type: str,
+        source_name: str,
+        message_content,
+        related_illust_ids,
+        success_log: str,
+        failure_log: str,
+    ) -> set[int]:
+        """发送消息并记录本次随机搜索发送尝试。"""
+        if not message_content:
+            return set()
+
+        illust_ids = list(related_illust_ids or [])
+        attempt_illust_ids = illust_ids or [None]
+
+        try:
+            if hasattr(message_content, "chain"):
+                await self.context.send_message(session_id, message_content)
+            elif isinstance(message_content, MessageChain):
+                await self.context.send_message(session_id, message_content)
+            elif isinstance(message_content, list):
+                raise TypeError("random_search 收到 list 类型消息内容，无法发送")
+            else:
+                chain = MessageChain().message(str(message_content))
+                await self.context.send_message(session_id, chain)
+
+            for illust_id in attempt_illust_ids:
+                add_random_search_send_attempt(
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    source_type=source_type,
+                    source_name=source_name,
+                    illust_id=illust_id,
+                    success=True,
+                )
+            logger.info(success_log)
+            return set(illust_ids)
+        except Exception as e:
+            for illust_id in attempt_illust_ids:
+                add_random_search_send_attempt(
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    source_type=source_type,
+                    source_name=source_name,
+                    illust_id=illust_id,
+                    success=False,
+                    error_message=str(e),
+                )
+            logger.error(f"{failure_log}: {e}")
+            return set()
+        finally:
+            await cleanup_pixiv_temp_files(message_content)
 
     async def _scheduler_tick(self):
         """
@@ -454,30 +511,18 @@ class RandomSearchService:
                     if hasattr(message_content, "chain"):
                         logger.info(f"消息链长度: {len(message_content.chain)}")
 
-                    try:
-                        if hasattr(message_content, "chain"):
-                            await self.context.send_message(session_id, message_content)
-                            sent_illust_ids.update(related_illust_ids or [])
-                        else:
-                            # 纯文本或列表的回退
-                            if isinstance(message_content, list):
-                                logger.warning(
-                                    "在 random_search 中收到列表而不是 MessageChain"
-                                )
-                                pass
-                            elif isinstance(message_content, MessageChain):
-                                await self.context.send_message(
-                                    session_id, message_content
-                                )
-                                sent_illust_ids.update(related_illust_ids or [])
-                            else:
-                                # 尝试字符串转换
-                                chain = MessageChain().message(str(message_content))
-                                await self.context.send_message(session_id, chain)
-                                sent_illust_ids.update(related_illust_ids or [])
-                        logger.info(f"消息已发送至 {session_id}")
-                    except Exception as e:
-                        logger.error(f"向 {session_id} 发送消息失败: {e}")
+                    sent_illust_ids.update(
+                        await self._send_message_with_attempt_record(
+                            chat_id=chat_id,
+                            session_id=session_id,
+                            source_type="tag",
+                            source_name=raw_tag,
+                            message_content=message_content,
+                            related_illust_ids=related_illust_ids,
+                            success_log=f"消息已发送至 {session_id}",
+                            failure_log=f"向 {session_id} 发送消息失败",
+                        )
+                    )
 
             # 记录已发送的作品ID到数据库
             for illust_id in sent_illust_ids:
@@ -585,20 +630,18 @@ class RandomSearchService:
                 include_related_ids=True,
             ):
                 if message_content:
-                    try:
-                        if hasattr(message_content, "chain"):
-                            await self.context.send_message(session_id, message_content)
-                            sent_illust_ids.update(related_illust_ids or [])
-                        elif isinstance(message_content, MessageChain):
-                            await self.context.send_message(session_id, message_content)
-                            sent_illust_ids.update(related_illust_ids or [])
-                        else:
-                            chain = MessageChain().message(str(message_content))
-                            await self.context.send_message(session_id, chain)
-                            sent_illust_ids.update(related_illust_ids or [])
-                        logger.info(f"排行榜消息已发送至 {session_id}")
-                    except Exception as e:
-                        logger.error(f"向 {session_id} 发送排行榜消息失败: {e}")
+                    sent_illust_ids.update(
+                        await self._send_message_with_attempt_record(
+                            chat_id=chat_id,
+                            session_id=session_id,
+                            source_type="ranking",
+                            source_name=mode,
+                            message_content=message_content,
+                            related_illust_ids=related_illust_ids,
+                            success_log=f"排行榜消息已发送至 {session_id}",
+                            failure_log=f"向 {session_id} 发送排行榜消息失败",
+                        )
+                    )
 
             for illust_id in sent_illust_ids:
                 add_sent_illust(illust_id, chat_id)
