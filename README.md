@@ -263,6 +263,9 @@
 | `random_search_quiet_hours_enabled` | 是否启用随机搜索静默时段，仅影响随机标签和随机排行榜 | false |
 | `random_search_quiet_start` | 随机搜索静默时段开始时间，格式 `HH:MM` | 00:00 |
 | `random_search_quiet_end` | 随机搜索静默时段结束时间，格式 `HH:MM` | 08:00 |
+| `random_search_empty_retry_enabled` | 随机搜索筛空时是否扩大搜索范围并补抽其他来源 | true |
+| `random_search_empty_retry_extra_depth` | 筛空时额外搜索页数，最多扩大到 10 页 | 3 |
+| `random_search_empty_retry_sources` | 筛空时额外补抽同群其他随机来源数量 | 1 |
 | `random_sent_illust_retention_days` | 已发送作品保留天数 | 7 |
 
 ## 🔧 故障排除

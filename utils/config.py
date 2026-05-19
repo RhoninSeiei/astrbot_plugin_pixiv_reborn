@@ -142,6 +142,15 @@ class PixivConfig:
         self.random_search_quiet_end = self.config.get(
             "random_search_quiet_end", "08:00"
         )
+        self.random_search_empty_retry_enabled = self.config.get(
+            "random_search_empty_retry_enabled", True
+        )
+        self.random_search_empty_retry_extra_depth = self.config.get(
+            "random_search_empty_retry_extra_depth", 3
+        )
+        self.random_search_empty_retry_sources = self.config.get(
+            "random_search_empty_retry_sources", 1
+        )
         self.random_sent_illust_retention_days = self.config.get(
             "random_sent_illust_retention_days", 7
         )
@@ -190,6 +199,9 @@ class PixivConfig:
             f"proxy='{effective_proxy or '未使用'}', "
             f"random_search_quiet_hours_enabled={self.random_search_quiet_hours_enabled}, "
             f"random_search_quiet_hours='{self.random_search_quiet_start}-{self.random_search_quiet_end}', "
+            f"random_search_empty_retry_enabled={self.random_search_empty_retry_enabled}, "
+            f"random_search_empty_retry_extra_depth={self.random_search_empty_retry_extra_depth}, "
+            f"random_search_empty_retry_sources={self.random_search_empty_retry_sources}, "
             f"fanbox_sessid={'已设置' if self.fanbox_sessid else '未设置'}, "
             f"fanbox_cookie={'已设置' if self.fanbox_cookie else '未设置'}, "
             f"fanbox_user_agent={'已设置' if self.fanbox_user_agent else '未设置'}, "
@@ -269,6 +281,13 @@ class PixivConfigManager:
             "random_search_quiet_hours_enabled": {"type": "bool"},
             "random_search_quiet_start": {"type": "string"},
             "random_search_quiet_end": {"type": "string"},
+            "random_search_empty_retry_enabled": {"type": "bool"},
+            "random_search_empty_retry_extra_depth": {
+                "type": "int",
+                "min": 0,
+                "max": 10,
+            },
+            "random_search_empty_retry_sources": {"type": "int", "min": 0, "max": 10},
             "proxy": {"type": "string", "hidden": True},
             "fanbox_sessid": {"type": "string", "hidden": True},
             "fanbox_cookie": {"type": "string", "hidden": True},
@@ -314,6 +333,9 @@ class PixivConfigManager:
             "random_search_quiet_hours_enabled",
             "random_search_quiet_start",
             "random_search_quiet_end",
+            "random_search_empty_retry_enabled",
+            "random_search_empty_retry_extra_depth",
+            "random_search_empty_retry_sources",
             "random_sent_illust_retention_days",
         ]
 

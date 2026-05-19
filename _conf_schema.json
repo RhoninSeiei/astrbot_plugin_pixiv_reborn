@@ -268,6 +268,28 @@
       "hint": "格式 HH:MM，例如 08:00。到达结束时间后恢复随机标签和随机排行榜推送。",
       "default": "08:00"
   },
+  "random_search_empty_retry_enabled": {
+      "description": "随机搜索空结果补偿",
+      "type": "bool",
+      "hint": "启用后，随机搜索筛选为空时会先扩大本次 tag 搜索页数，再补抽同群其他随机来源。",
+      "default": true
+  },
+  "random_search_empty_retry_extra_depth": {
+      "description": "随机搜索空结果额外页数",
+      "type": "int",
+      "hint": "tag 随机搜索筛选为空时临时增加的页数。默认 3 表示 deep_search_depth=3 时最多扩大到 6 页，上限 10 页。",
+      "default": 3,
+      "min": 0,
+      "max": 10
+  },
+  "random_search_empty_retry_sources": {
+      "description": "随机搜索空结果补抽来源数",
+      "type": "int",
+      "hint": "同一群聊首个随机来源筛选为空后，额外尝试的 tag 或排行榜来源数量。0 表示只扩大当前 tag。",
+      "default": 1,
+      "min": 0,
+      "max": 10
+  },
   "random_sent_illust_retention_days": {
       "description": "随机搜索已发送作品保留天数,以避免重复发送",
       "type": "int",

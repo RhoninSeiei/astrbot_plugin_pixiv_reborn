@@ -101,6 +101,15 @@ class RandomSearchSendAttempt(BaseModel):
     created_at = pw.DateTimeField(default=datetime.now)
 
 
+class RandomSearchExecutionClaim(BaseModel):
+    """随机搜索执行领取记录，用于跨服务实例防重。"""
+
+    chat_id = pw.CharField(primary_key=True)
+    owner_token = pw.TextField(null=True)
+    claimed_at = pw.DateTimeField(default=datetime.now)
+    expires_at = pw.DateTimeField()
+
+
 def _coerce_schedule_time(value, chat_id: str = ""):
     """将数据库中的调度时间统一转换为 datetime。"""
     if value is None:
@@ -198,6 +207,12 @@ def initialize_database():
             db.create_tables([RandomSearchSendAttempt])
             logger.info(
                 "数据库初始化成功，数据表 random_search_send_attempt 已创建。"
+            )
+
+        if not RandomSearchExecutionClaim.table_exists():
+            db.create_tables([RandomSearchExecutionClaim])
+            logger.info(
+                "数据库初始化成功，数据表 random_search_execution_claim 已创建。"
             )
 
         if not RandomRankingConfig.table_exists():
@@ -539,6 +554,62 @@ def add_random_search_send_attempt(
             )
     except Exception as e:
         logger.error(f"添加随机搜索发送尝试记录失败: {e}")
+
+
+def try_claim_random_search_execution(
+    chat_id: str,
+    now: datetime = None,
+    expires_at: datetime = None,
+    owner_token: str = None,
+) -> bool:
+    """领取一个群聊的随机搜索执行权。未过期领取存在时返回 False。"""
+    try:
+        current_time = now or datetime.now()
+        expire_time = expires_at or (current_time + timedelta(minutes=30))
+
+        with db.atomic():
+            claim = RandomSearchExecutionClaim.get_or_none(
+                RandomSearchExecutionClaim.chat_id == chat_id
+            )
+            if claim:
+                claim_expires_at = _coerce_schedule_time(claim.expires_at, chat_id)
+                if claim_expires_at and claim_expires_at > current_time:
+                    return False
+
+                (
+                    RandomSearchExecutionClaim.update(
+                        owner_token=owner_token,
+                        claimed_at=current_time,
+                        expires_at=expire_time,
+                    )
+                    .where(RandomSearchExecutionClaim.chat_id == chat_id)
+                    .execute()
+                )
+                return True
+
+            RandomSearchExecutionClaim.create(
+                chat_id=chat_id,
+                owner_token=owner_token,
+                claimed_at=current_time,
+                expires_at=expire_time,
+            )
+            return True
+    except Exception as e:
+        logger.error(f"领取随机搜索执行权失败: {e}")
+        return False
+
+
+def release_random_search_execution(chat_id: str, owner_token: str = None):
+    """释放一个群聊的随机搜索执行领取记录。"""
+    try:
+        query = RandomSearchExecutionClaim.delete().where(
+            RandomSearchExecutionClaim.chat_id == chat_id
+        )
+        if owner_token is not None:
+            query = query.where(RandomSearchExecutionClaim.owner_token == owner_token)
+        query.execute()
+    except Exception as e:
+        logger.error(f"释放随机搜索执行权失败: {e}")
 
 
 def is_illust_sent(illust_id: int, chat_id: str) -> bool:

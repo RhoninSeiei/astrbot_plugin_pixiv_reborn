@@ -1,6 +1,8 @@
 import asyncio
 import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from uuid import uuid4
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api import logger
 from astrbot.core.message.message_event_result import MessageChain
@@ -19,19 +21,32 @@ from .database import (
     get_random_rankings,
     get_random_search_group_config,
     add_random_search_send_attempt,
+    try_claim_random_search_execution,
+    release_random_search_execution,
 )
 from .tag import (
     build_detail_message,
     FilterConfig,
     validate_and_process_tags,
     process_and_send_illusts,
+    filter_illusts_with_reason,
 )
 from .pixiv_utils import send_pixiv_image, send_forward_message, cleanup_pixiv_temp_files
+from .random_empty_retry import build_retry_source_sequence, resolve_retry_depth
 from .random_schedule import normalize_schedule_time
 from .random_group_config import resolve_random_search_runtime_config
 
 
+@dataclass
+class RandomSearchExecutionResult:
+    completed: bool = True
+    had_sendable_candidates: bool = False
+    sent_count: int = 0
+
+
 class RandomSearchService:
+    EXECUTION_LEASE_MINUTES = 30
+
     def __init__(self, client_wrapper, pixiv_config, context):
         self.client_wrapper = client_wrapper
         self.client = client_wrapper.client_api
@@ -128,6 +143,101 @@ class RandomSearchService:
         group_config = self._resolve_group_runtime_config(chat_id)
         return group_config.min_interval_minutes, group_config.max_interval_minutes
 
+    def _empty_retry_enabled(self) -> bool:
+        return bool(
+            getattr(self.pixiv_config, "random_search_empty_retry_enabled", True)
+        )
+
+    def _empty_retry_extra_depth(self) -> int:
+        value = getattr(self.pixiv_config, "random_search_empty_retry_extra_depth", 3)
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 3
+
+    def _empty_retry_sources(self) -> int:
+        value = getattr(self.pixiv_config, "random_search_empty_retry_sources", 1)
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 1
+
+    def _claim_execution(self, chat_id: str, now: datetime = None) -> str | None:
+        current_time = now or datetime.now()
+        owner_token = f"{id(self)}:{uuid4().hex}"
+        expires_at = current_time + timedelta(minutes=self.EXECUTION_LEASE_MINUTES)
+        claimed = try_claim_random_search_execution(
+            chat_id,
+            now=current_time,
+            expires_at=expires_at,
+            owner_token=owner_token,
+        )
+        if claimed:
+            return owner_token
+        return None
+
+    def _schedule_next_run_from_now(self, chat_id: str, now: datetime, reason: str):
+        min_interval, max_interval = self._get_group_interval_range(chat_id)
+        next_interval = random.randint(min_interval, max_interval)
+        new_execution_time = now + timedelta(minutes=next_interval)
+        return self._set_schedule_time(chat_id, new_execution_time, reason)
+
+    def _build_filter_config(self, display_tag_str: str, exclude_tags, chat_id: str):
+        group_config = self._resolve_group_runtime_config(chat_id)
+        return FilterConfig(
+            r18_mode=self.pixiv_config.r18_mode,
+            filter_r18g_only=self.pixiv_config.filter_r18g_only,
+            ai_filter_mode=self.pixiv_config.ai_filter_mode,
+            ai_detection_mode=self.pixiv_config.ai_detection_mode,
+            display_tag_str=display_tag_str,
+            return_count=group_config.return_count,
+            logger=logger,
+            show_filter_result=self.pixiv_config.show_filter_result,
+            single_response_mode=self.pixiv_config.single_response_mode,
+            excluded_tags=exclude_tags or [],
+            forward_threshold=self.pixiv_config.forward_threshold,
+            show_details=self.pixiv_config.show_details,
+            min_likes=group_config.min_likes,
+        )
+
+    def _has_sendable_candidates(self, illusts, config: FilterConfig) -> bool:
+        filtered_illusts, filter_msgs = filter_illusts_with_reason(illusts, config)
+        if not filtered_illusts:
+            if filter_msgs:
+                for msg in filter_msgs:
+                    logger.info(f"随机搜索候选为空: {msg}")
+            else:
+                logger.info("随机搜索候选为空: 共享过滤后无可发送作品")
+            return False
+        return True
+
+    def _make_mock_event(self):
+        class MockEvent:
+            def __init__(self):
+                self.bot = None
+
+            def chain_result(self, chain):
+                message_chain = MessageChain()
+                message_chain.chain = chain
+                return message_chain
+
+            def plain_result(self, text):
+                message_chain = MessageChain()
+                message_chain.message(text)
+                return message_chain
+
+            def get_platform_name(self):
+                return "unknown"
+
+            def get_group_id(self):
+                return None
+
+        return MockEvent()
+
     async def _send_message_with_attempt_record(
         self,
         chat_id: str,
@@ -212,7 +322,7 @@ class RandomSearchService:
 
             now = datetime.now()
 
-            pending_groups = []
+            pending_tasks = []
 
             for chat_id in groups:
                 # 初始化执行锁
@@ -248,14 +358,26 @@ class RandomSearchService:
                             f"群组 {chat_id}: 当前处于随机搜索静默时段，推迟到 {next_allowed_time}"
                         )
                         continue
-                    pending_groups.append(chat_id)
+                    claim_token = self._claim_execution(chat_id, now)
+                    if not claim_token:
+                        logger.info(f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次入队")
+                        continue
+                    scheduled_time = self._schedule_next_run_from_now(
+                        chat_id, now, "防重预占调度时间"
+                    )
+                    logger.info(
+                        f"群组 {chat_id}: 已预占随机搜索执行权，下次候选运行时间为 {scheduled_time}"
+                    )
+                    pending_tasks.append((chat_id, claim_token))
 
             # 将所有待执行的群组加入队列
-            for chat_id in pending_groups:
+            for task_item in pending_tasks:
+                chat_id, claim_token = task_item
                 try:
-                    await self.task_queue.put(chat_id)
+                    await self.task_queue.put(task_item)
                     logger.info(f"群组 {chat_id}: 已加入随机搜索队列")
                 except Exception as e:
+                    release_random_search_execution(chat_id, claim_token)
                     logger.error(f"将群组 {chat_id} 加入队列失败: {e}")
 
         except Exception as e:
@@ -270,15 +392,31 @@ class RandomSearchService:
             while self._is_running:
                 try:
                     # 从队列中获取群组ID（阻塞等待）
-                    chat_id = await self.task_queue.get()
+                    task_item = await self.task_queue.get()
+                    if isinstance(task_item, tuple):
+                        chat_id, claim_token = task_item
+                    else:
+                        chat_id = task_item
+                        claim_token = None
 
                     # 使用全局锁确保同时只有一个任务执行
                     async with self.global_execution_lock:
                         # 再次检查群组是否仍在执行状态
                         if self.execution_locks.get(chat_id, False):
                             logger.warning(f"群组 {chat_id} 已在执行状态，跳过本次任务")
+                            if claim_token:
+                                release_random_search_execution(chat_id, claim_token)
                             self.task_queue.task_done()
                             continue
+
+                        if claim_token is None:
+                            claim_token = self._claim_execution(chat_id)
+                            if not claim_token:
+                                logger.info(
+                                    f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次任务"
+                                )
+                                self.task_queue.task_done()
+                                continue
 
                         # 设置执行锁
                         self.execution_locks[chat_id] = True
@@ -289,14 +427,8 @@ class RandomSearchService:
 
                             # 调度下次运行
                             now = datetime.now()
-                            min_interval, max_interval = (
-                                self._get_group_interval_range(chat_id)
-                            )
-
-                            next_interval = random.randint(min_interval, max_interval)
-                            new_execution_time = now + timedelta(minutes=next_interval)
-                            scheduled_time = self._set_schedule_time(
-                                chat_id, new_execution_time, "下次调度时间"
+                            scheduled_time = self._schedule_next_run_from_now(
+                                chat_id, now, "下次调度时间"
                             )
                             logger.info(
                                 f"群组 {chat_id}: 随机搜索已执行。下次运行时间为 {scheduled_time}。"
@@ -307,6 +439,7 @@ class RandomSearchService:
                         finally:
                             # 释放执行锁
                             self.execution_locks[chat_id] = False
+                            release_random_search_execution(chat_id, claim_token)
                             self.task_queue.task_done()
 
                 except asyncio.CancelledError:
@@ -333,13 +466,13 @@ class RandomSearchService:
         except Exception as e:
             logger.error(f"清理过期记录任务出错: {e}")
 
-    async def execute_search_for_group(self, chat_id: str):
+    async def execute_search_for_group(self, chat_id: str) -> int:
         """为特定群组执行随机搜索（标签或排行榜）"""
         tags = get_random_tags(chat_id)
         rankings = get_random_rankings(chat_id)
 
         if not tags and not rankings:
-            return
+            return 0
 
         # 随机选择执行标签搜索或排行榜搜索
         all_options = []
@@ -349,13 +482,173 @@ class RandomSearchService:
             all_options.append(("ranking", ranking))
 
         selected = random.choice(all_options)
-
-        if selected[0] == "tag":
-            await self._execute_tag_search(chat_id, selected[1])
+        if self._empty_retry_enabled():
+            source_sequence = build_retry_source_sequence(
+                all_options, selected, self._empty_retry_sources()
+            )
         else:
-            await self._execute_ranking_search(chat_id, selected[1])
+            source_sequence = [selected]
 
-    async def _execute_tag_search(self, chat_id: str, selected_tag_entry):
+        first_option = source_sequence[0]
+
+        for index, option in enumerate(source_sequence):
+            if index > 0:
+                logger.info(
+                    f"群组 {chat_id}: 前一个随机搜索来源无可发送作品，尝试补抽其他来源"
+                )
+
+            if option[0] == "tag":
+                result = await self._execute_tag_search(chat_id, option[1])
+            else:
+                result = await self._execute_ranking_search(chat_id, option[1])
+
+            if not result.completed:
+                return result.sent_count
+            if result.had_sendable_candidates:
+                return result.sent_count
+
+        await self._send_no_result_notice(chat_id, first_option)
+        return 0
+
+    def _option_name(self, option) -> str:
+        if option[0] == "tag":
+            return option[1].tag
+        return option[1].mode
+
+    def _option_session_id(self, option) -> str:
+        return option[1].session_id
+
+    async def _send_no_result_notice(self, chat_id: str, option):
+        source_type = option[0]
+        source_name = self._option_name(option)
+        session_id = self._option_session_id(option)
+        message_content = MessageChain().message("没有找到符合条件的作品。")
+        await self._send_message_with_attempt_record(
+            chat_id=chat_id,
+            session_id=session_id,
+            source_type=source_type,
+            source_name=source_name,
+            message_content=message_content,
+            related_illust_ids=[],
+            success_log=f"随机搜索空结果提示已发送至 {session_id}",
+            failure_log=f"向 {session_id} 发送随机搜索空结果提示失败",
+        )
+
+    async def _fetch_tag_illusts(
+        self,
+        raw_tag: str,
+        search_params: dict,
+        page_limit: int,
+        all_illusts=None,
+        page_count: int = 0,
+        next_params=None,
+    ):
+        all_illusts = list(all_illusts or [])
+        next_params = next_params or search_params.copy()
+
+        while next_params:
+            if page_limit > 0 and page_count >= page_limit:
+                break
+
+            json_result = await asyncio.to_thread(
+                self.client.search_illust, **next_params
+            )
+
+            if not json_result or not hasattr(json_result, "illusts"):
+                break
+
+            current_illusts = json_result.illusts
+            if current_illusts:
+                all_illusts.extend(current_illusts)
+                page_count += 1
+                logger.info(
+                    f"标签 {raw_tag} 的随机搜索：已获取第 {page_count} 页，找到 {len(current_illusts)} 个插画"
+                )
+
+                if page_count % 3 == 0:
+                    logger.info(
+                        f"标签 {raw_tag} 搜索进行中：已获取 {page_count} 页，共 {len(all_illusts)} 个结果..."
+                    )
+            else:
+                break
+
+            next_url = json_result.next_url
+            next_params = self.client.parse_qs(next_url) if next_url else None
+
+            if next_params:
+                await asyncio.sleep(0.5)
+
+        return all_illusts, page_count, next_params
+
+    async def _send_tag_search_results(
+        self,
+        chat_id: str,
+        session_id: str,
+        raw_tag: str,
+        display_tags: str,
+        exclude_tags,
+        all_illusts,
+    ) -> RandomSearchExecutionResult:
+        initial_illusts = filter_sent_illusts(all_illusts, chat_id)
+
+        if not initial_illusts:
+            logger.info(f"标签 {raw_tag} 的随机搜索过滤已发送记录后无可用作品。")
+            return RandomSearchExecutionResult(had_sendable_candidates=False)
+
+        config = self._build_filter_config(
+            display_tag_str=f"随机:{display_tags}",
+            exclude_tags=exclude_tags,
+            chat_id=chat_id,
+        )
+        if not self._has_sendable_candidates(initial_illusts, config):
+            logger.info(f"标签 {raw_tag} 的随机搜索共享过滤后无可用作品。")
+            return RandomSearchExecutionResult(had_sendable_candidates=False)
+
+        mock_event = self._make_mock_event()
+        sent_illust_ids = set()
+
+        async for message_content, related_illust_ids in process_and_send_illusts(
+            initial_illusts,
+            config,
+            self.client,
+            mock_event,
+            build_detail_message,
+            send_pixiv_image,
+            send_forward_message,
+            is_novel=False,
+            include_related_ids=True,
+        ):
+            if message_content:
+                logger.info(f"准备向 session_id: {session_id} 发送消息")
+                if hasattr(message_content, "chain"):
+                    logger.info(f"消息链长度: {len(message_content.chain)}")
+
+                sent_illust_ids.update(
+                    await self._send_message_with_attempt_record(
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        source_type="tag",
+                        source_name=raw_tag,
+                        message_content=message_content,
+                        related_illust_ids=related_illust_ids,
+                        success_log=f"消息已发送至 {session_id}",
+                        failure_log=f"向 {session_id} 发送消息失败",
+                    )
+                )
+
+        for illust_id in sent_illust_ids:
+            add_sent_illust(illust_id, chat_id)
+        if sent_illust_ids:
+            logger.info(f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录")
+
+        return RandomSearchExecutionResult(
+            had_sendable_candidates=True,
+            sent_count=len(sent_illust_ids),
+        )
+
+    async def _execute_tag_search(
+        self, chat_id: str, selected_tag_entry
+    ) -> RandomSearchExecutionResult:
         """执行标签搜索"""
         raw_tag = selected_tag_entry.tag
         session_id = selected_tag_entry.session_id
@@ -365,7 +658,7 @@ class RandomSearchService:
         # 如果需要则认证
         if not await self.client_wrapper.authenticate():
             logger.error(f"群组 {chat_id} 的随机搜索失败: 认证失败。")
-            return
+            return RandomSearchExecutionResult(completed=False)
 
         # 处理标签
         tag_result = validate_and_process_tags(raw_tag)
@@ -373,7 +666,7 @@ class RandomSearchService:
             logger.warning(
                 f"标签 {raw_tag} 的随机搜索验证失败: {tag_result['error_message']}"
             )
-            return
+            return RandomSearchExecutionResult(completed=False)
 
         search_tags = tag_result["search_tags"]
         exclude_tags = tag_result["exclude_tags"]
@@ -389,54 +682,14 @@ class RandomSearchService:
                 "req_auth": True,
             }
 
-            # 执行深度搜索，完全参考 pixiv_deepsearch 的实现
-            all_illusts = []
-            page_count = 0
             deep_search_depth = self.pixiv_config.deep_search_depth
-            next_params = search_params.copy()
-
-            # 循环获取多页结果
-            while next_params:
-                # 限制页数
-                if deep_search_depth > 0 and page_count >= deep_search_depth:
-                    break
-
-                # 搜索当前页，使用与 pixiv_deepsearch 相同的方式
-                json_result = await asyncio.to_thread(
-                    self.client.search_illust, **next_params
-                )
-
-                if not json_result or not hasattr(json_result, "illusts"):
-                    break
-
-                # 收集当前页的插画
-                current_illusts = json_result.illusts
-                if current_illusts:
-                    all_illusts.extend(current_illusts)
-                    page_count += 1
-                    logger.info(
-                        f"标签 {raw_tag} 的随机搜索：已获取第 {page_count} 页，找到 {len(current_illusts)} 个插画"
-                    )
-
-                    # 发送进度更新（每3页更新一次，与 pixiv_deepsearch 保持一致）
-                    if page_count % 3 == 0:
-                        logger.info(
-                            f"标签 {raw_tag} 搜索进行中：已获取 {page_count} 页，共 {len(all_illusts)} 个结果..."
-                        )
-                else:
-                    break
-
-                # 获取下一页参数，使用与 pixiv_deepsearch 相同的方式
-                next_url = json_result.next_url
-                next_params = self.client.parse_qs(next_url) if next_url else None
-
-                # 避免请求过于频繁，与 pixiv_deepsearch 保持一致的延迟
-                if next_params:
-                    await asyncio.sleep(0.5)  # 添加延迟，避免请求过快
+            all_illusts, page_count, next_params = await self._fetch_tag_illusts(
+                raw_tag, search_params, deep_search_depth
+            )
 
             if not all_illusts:
                 logger.info(f"标签 {raw_tag} 的随机搜索未返回结果。")
-                return
+                return RandomSearchExecutionResult(had_sendable_candidates=False)
 
             # 记录找到的总数量，与 pixiv_deepsearch 保持一致
             initial_count = len(all_illusts)
@@ -444,98 +697,57 @@ class RandomSearchService:
                 f"标签 {raw_tag} 的随机搜索完成，共获取 {page_count} 页，找到 {initial_count} 个插画，开始过滤处理..."
             )
 
-            # 过滤已发送的作品
-            initial_illusts = filter_sent_illusts(all_illusts, chat_id)
-
-            if not initial_illusts:
-                logger.info(f"标签 {raw_tag} 的随机搜索过滤后无可用作品。")
-                return
-
-            # 发送配置
-            group_config = self._resolve_group_runtime_config(chat_id)
-            config = FilterConfig(
-                r18_mode=self.pixiv_config.r18_mode,
-                filter_r18g_only=self.pixiv_config.filter_r18g_only,
-                ai_filter_mode=self.pixiv_config.ai_filter_mode,
-                ai_detection_mode=self.pixiv_config.ai_detection_mode,
-                display_tag_str=f"随机:{display_tags}",
-                return_count=group_config.return_count,
-                logger=logger,
-                show_filter_result=self.pixiv_config.show_filter_result,
-                single_response_mode=self.pixiv_config.single_response_mode,
-                excluded_tags=exclude_tags or [],
-                forward_threshold=self.pixiv_config.forward_threshold,
-                show_details=self.pixiv_config.show_details,
-                min_likes=group_config.min_likes,
+            result = await self._send_tag_search_results(
+                chat_id,
+                session_id,
+                raw_tag,
+                display_tags,
+                exclude_tags,
+                all_illusts,
             )
+            if result.had_sendable_candidates:
+                return result
 
-            # 创建模拟事件以捕获输出
-            class MockEvent:
-                def __init__(self):
-                    self.bot = None  # 模拟 bot 属性
-
-                def chain_result(self, chain):
-                    message_chain = MessageChain()
-                    message_chain.chain = chain
-                    return message_chain
-
-                def plain_result(self, text):
-                    message_chain = MessageChain()
-                    message_chain.message(text)
-                    return message_chain
-
-                def get_platform_name(self):
-                    return "unknown"
-
-                def get_group_id(self):
-                    return None
-
-            mock_event = MockEvent()
-
-            # 复用 process_and_send_illusts
-            sent_illust_ids = set()  # 记录已发送的作品ID
-
-            async for message_content, related_illust_ids in process_and_send_illusts(
-                initial_illusts,
-                config,
-                self.client,
-                mock_event,
-                build_detail_message,
-                send_pixiv_image,
-                send_forward_message,
-                is_novel=False,
-                include_related_ids=True,
+            retry_depth = resolve_retry_depth(
+                deep_search_depth, self._empty_retry_extra_depth()
+            )
+            if (
+                self._empty_retry_enabled()
+                and retry_depth != deep_search_depth
+                and next_params
             ):
-                if message_content:
-                    logger.info(f"准备向 session_id: {session_id} 发送消息")
-                    if hasattr(message_content, "chain"):
-                        logger.info(f"消息链长度: {len(message_content.chain)}")
-
-                    sent_illust_ids.update(
-                        await self._send_message_with_attempt_record(
-                            chat_id=chat_id,
-                            session_id=session_id,
-                            source_type="tag",
-                            source_name=raw_tag,
-                            message_content=message_content,
-                            related_illust_ids=related_illust_ids,
-                            success_log=f"消息已发送至 {session_id}",
-                            failure_log=f"向 {session_id} 发送消息失败",
-                        )
-                    )
-
-            # 记录已发送的作品ID到数据库
-            for illust_id in sent_illust_ids:
-                add_sent_illust(illust_id, chat_id)
-            if sent_illust_ids:
                 logger.info(
-                    f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录"
+                    f"标签 {raw_tag} 在前 {page_count} 页无可发送作品，扩大搜索范围到 {retry_depth} 页"
                 )
+                all_illusts, page_count, next_params = await self._fetch_tag_illusts(
+                    raw_tag,
+                    search_params,
+                    retry_depth,
+                    all_illusts=all_illusts,
+                    page_count=page_count,
+                    next_params=next_params,
+                )
+                logger.info(
+                    f"标签 {raw_tag} 的扩大搜索完成，共获取 {page_count} 页，找到 {len(all_illusts)} 个插画，重新过滤处理..."
+                )
+                return await self._send_tag_search_results(
+                    chat_id,
+                    session_id,
+                    raw_tag,
+                    display_tags,
+                    exclude_tags,
+                    all_illusts,
+                )
+
+            return result
 
         except Exception as e:
             logger.error(f"为群组 {chat_id} 执行随机标签搜索时出错: {e}")
+            return RandomSearchExecutionResult(completed=False)
 
-    async def _execute_ranking_search(self, chat_id: str, ranking_config):
+    async def _execute_ranking_search(
+        self, chat_id: str, ranking_config
+    ) -> RandomSearchExecutionResult:
         """执行排行榜搜索"""
         mode = ranking_config.mode
         date = ranking_config.date
@@ -547,7 +759,7 @@ class RandomSearchService:
 
         if not await self.client_wrapper.authenticate():
             logger.error(f"群组 {chat_id} 的随机排行榜搜索失败: 认证失败。")
-            return
+            return RandomSearchExecutionResult(completed=False)
 
         try:
             ranking_result = await asyncio.to_thread(
@@ -557,7 +769,7 @@ class RandomSearchService:
 
             if not initial_illusts:
                 logger.info(f"排行榜 {mode} 的随机搜索未返回结果。")
-                return
+                return RandomSearchExecutionResult(had_sendable_candidates=False)
 
             # Pixiv 排行榜接口在非 manga 模式下也可能混入 type=manga 的作品，这里主动过滤掉
             if mode and "manga" not in str(mode).lower():
@@ -576,46 +788,18 @@ class RandomSearchService:
 
             if not initial_illusts:
                 logger.info(f"排行榜 {mode} 的随机搜索过滤后无可用作品。")
-                return
+                return RandomSearchExecutionResult(had_sendable_candidates=False)
 
-            group_config = self._resolve_group_runtime_config(chat_id)
-            config = FilterConfig(
-                r18_mode=self.pixiv_config.r18_mode,
-                filter_r18g_only=self.pixiv_config.filter_r18g_only,
-                ai_filter_mode=self.pixiv_config.ai_filter_mode,
-                ai_detection_mode=self.pixiv_config.ai_detection_mode,
+            config = self._build_filter_config(
                 display_tag_str=f"随机排行榜:{mode}",
-                return_count=group_config.return_count,
-                logger=logger,
-                show_filter_result=self.pixiv_config.show_filter_result,
-                single_response_mode=self.pixiv_config.single_response_mode,
-                excluded_tags=[],
-                forward_threshold=self.pixiv_config.forward_threshold,
-                show_details=self.pixiv_config.show_details,
-                min_likes=group_config.min_likes,
+                exclude_tags=[],
+                chat_id=chat_id,
             )
+            if not self._has_sendable_candidates(initial_illusts, config):
+                logger.info(f"排行榜 {mode} 的随机搜索共享过滤后无可用作品。")
+                return RandomSearchExecutionResult(had_sendable_candidates=False)
 
-            class MockEvent:
-                def __init__(self):
-                    self.bot = None
-
-                def chain_result(self, chain):
-                    message_chain = MessageChain()
-                    message_chain.chain = chain
-                    return message_chain
-
-                def plain_result(self, text):
-                    message_chain = MessageChain()
-                    message_chain.message(text)
-                    return message_chain
-
-                def get_platform_name(self):
-                    return "unknown"
-
-                def get_group_id(self):
-                    return None
-
-            mock_event = MockEvent()
+            mock_event = self._make_mock_event()
             sent_illust_ids = set()
 
             async for message_content, related_illust_ids in process_and_send_illusts(
@@ -649,9 +833,14 @@ class RandomSearchService:
                 logger.info(
                     f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个排行榜作品的发送记录"
                 )
+            return RandomSearchExecutionResult(
+                had_sendable_candidates=True,
+                sent_count=len(sent_illust_ids),
+            )
 
         except Exception as e:
             logger.error(f"为群组 {chat_id} 执行随机排行榜搜索时出错: {e}")
+            return RandomSearchExecutionResult(completed=False)
 
     def suspend_group_search(self, chat_id: str):
         """暂停指定群组的随机搜索"""
@@ -700,7 +889,7 @@ class RandomSearchService:
             return False
 
         try:
-            await self.task_queue.put(chat_id)
+            await self.task_queue.put((chat_id, None))
             logger.info(f"群组 {chat_id} 已强制加入执行队列")
             return True
         except Exception as e:
