@@ -32,7 +32,11 @@ from .tag import (
     filter_illusts_with_reason,
 )
 from .pixiv_utils import send_pixiv_image, send_forward_message, cleanup_pixiv_temp_files
-from .random_empty_retry import build_retry_source_sequence, resolve_retry_depth
+from .random_empty_retry import (
+    build_retry_source_sequence,
+    enforce_random_push_delivery_policy,
+    resolve_retry_depth,
+)
 from .random_schedule import normalize_schedule_time
 from .random_group_config import resolve_random_search_runtime_config
 
@@ -189,19 +193,23 @@ class RandomSearchService:
     def _build_filter_config(self, display_tag_str: str, exclude_tags, chat_id: str):
         group_config = self._resolve_group_runtime_config(chat_id)
         return FilterConfig(
-            r18_mode=self.pixiv_config.r18_mode,
-            filter_r18g_only=self.pixiv_config.filter_r18g_only,
-            ai_filter_mode=self.pixiv_config.ai_filter_mode,
-            ai_detection_mode=self.pixiv_config.ai_detection_mode,
-            display_tag_str=display_tag_str,
-            return_count=group_config.return_count,
-            logger=logger,
-            show_filter_result=self.pixiv_config.show_filter_result,
-            single_response_mode=self.pixiv_config.single_response_mode,
-            excluded_tags=exclude_tags or [],
-            forward_threshold=self.pixiv_config.forward_threshold,
-            show_details=self.pixiv_config.show_details,
-            min_likes=group_config.min_likes,
+            **enforce_random_push_delivery_policy(
+                {
+                    "r18_mode": self.pixiv_config.r18_mode,
+                    "filter_r18g_only": self.pixiv_config.filter_r18g_only,
+                    "ai_filter_mode": self.pixiv_config.ai_filter_mode,
+                    "ai_detection_mode": self.pixiv_config.ai_detection_mode,
+                    "display_tag_str": display_tag_str,
+                    "return_count": group_config.return_count,
+                    "logger": logger,
+                    "show_filter_result": self.pixiv_config.show_filter_result,
+                    "single_response_mode": self.pixiv_config.single_response_mode,
+                    "excluded_tags": exclude_tags or [],
+                    "forward_threshold": self.pixiv_config.forward_threshold,
+                    "show_details": self.pixiv_config.show_details,
+                    "min_likes": group_config.min_likes,
+                }
+            )
         )
 
     def _has_sendable_candidates(self, illusts, config: FilterConfig) -> bool:

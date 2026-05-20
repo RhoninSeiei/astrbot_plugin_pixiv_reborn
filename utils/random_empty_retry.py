@@ -50,3 +50,12 @@ def build_retry_source_sequence(
     remaining = [option for option in options if option != selected]
     shuffle_func(remaining)
     return [selected] + remaining[:extra_count]
+
+
+def enforce_random_push_delivery_policy(filter_config_kwargs):
+    """Keep scheduled random pushes as direct chat messages."""
+    normalized = dict(filter_config_kwargs)
+    normalized["show_filter_result"] = False
+    normalized["single_response_mode"] = False
+    normalized["forward_threshold"] = False
+    return normalized

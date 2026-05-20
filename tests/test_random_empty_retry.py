@@ -2,6 +2,7 @@ import unittest
 
 from utils.random_empty_retry import (
     build_retry_source_sequence,
+    enforce_random_push_delivery_policy,
     resolve_retry_depth,
 )
 
@@ -53,6 +54,22 @@ class RandomSearchEmptyRetryTest(unittest.TestCase):
             ),
             [selected],
         )
+
+    def test_random_push_delivery_policy_forces_direct_silent_messages(self):
+        config_kwargs = {
+            "show_filter_result": True,
+            "single_response_mode": True,
+            "forward_threshold": True,
+            "return_count": 3,
+        }
+
+        normalized = enforce_random_push_delivery_policy(config_kwargs)
+
+        self.assertFalse(normalized["show_filter_result"])
+        self.assertFalse(normalized["single_response_mode"])
+        self.assertFalse(normalized["forward_threshold"])
+        self.assertEqual(normalized["return_count"], 3)
+        self.assertTrue(config_kwargs["single_response_mode"])
 
 
 if __name__ == "__main__":
