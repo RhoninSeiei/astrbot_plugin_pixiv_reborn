@@ -28,13 +28,13 @@ from .tag import (
     build_detail_message,
     FilterConfig,
     validate_and_process_tags,
-    process_and_send_illusts,
     filter_illusts_with_reason,
 )
-from .pixiv_utils import send_pixiv_image, send_forward_message, cleanup_pixiv_temp_files
+from .pixiv_utils import send_pixiv_image, cleanup_pixiv_temp_files
 from .random_empty_retry import (
     build_retry_source_sequence,
     enforce_random_push_delivery_policy,
+    is_random_push_image_failure_notice,
     resolve_retry_depth,
 )
 from .random_schedule import normalize_schedule_time
@@ -50,6 +50,8 @@ class RandomSearchExecutionResult:
 
 class RandomSearchService:
     EXECUTION_LEASE_MINUTES = 30
+    RANDOM_IMAGE_SEND_RETRIES = 3
+    RANDOM_IMAGE_FAILURE_STREAK_LIMIT = 2
 
     def __init__(self, client_wrapper, pixiv_config, context):
         self.client_wrapper = client_wrapper
@@ -212,17 +214,6 @@ class RandomSearchService:
             )
         )
 
-    def _has_sendable_candidates(self, illusts, config: FilterConfig) -> bool:
-        filtered_illusts, filter_msgs = filter_illusts_with_reason(illusts, config)
-        if not filtered_illusts:
-            if filter_msgs:
-                for msg in filter_msgs:
-                    logger.info(f"随机搜索候选为空: {msg}")
-            else:
-                logger.info("随机搜索候选为空: 共享过滤后无可发送作品")
-            return False
-        return True
-
     def _make_mock_event(self):
         class MockEvent:
             def __init__(self):
@@ -301,6 +292,197 @@ class RandomSearchService:
             return set()
         finally:
             await cleanup_pixiv_temp_files(message_content)
+
+    def _get_illust_id(self, item) -> int | None:
+        try:
+            item_id = getattr(item, "id", None)
+            if item_id is not None:
+                return int(item_id)
+        except Exception:
+            pass
+        try:
+            if isinstance(item, dict) and "id" in item:
+                return int(item["id"])
+        except Exception:
+            pass
+        return None
+
+    async def _send_random_illust_with_retry(
+        self,
+        chat_id: str,
+        session_id: str,
+        source_type: str,
+        source_name: str,
+        illust,
+        config: FilterConfig,
+    ) -> set[int]:
+        illust_id = self._get_illust_id(illust)
+        related_ids = [illust_id] if illust_id is not None else []
+        detail_message = build_detail_message(illust, is_novel=False)
+
+        for attempt in range(1, self.RANDOM_IMAGE_SEND_RETRIES + 1):
+            yielded_message = False
+            try:
+                mock_event = self._make_mock_event()
+                async for message_content in send_pixiv_image(
+                    self.client,
+                    mock_event,
+                    illust,
+                    detail_message,
+                    show_details=config.show_details,
+                ):
+                    yielded_message = True
+                    if is_random_push_image_failure_notice(message_content):
+                        await cleanup_pixiv_temp_files(message_content)
+                        logger.warning(
+                            "随机推送图片下载失败，作品 %s 第 %s/%s 次尝试失败。"
+                            % (
+                                illust_id or "unknown",
+                                attempt,
+                                self.RANDOM_IMAGE_SEND_RETRIES,
+                            )
+                        )
+                        continue
+
+                    logger.info(f"准备向 session_id: {session_id} 发送消息")
+                    if hasattr(message_content, "chain"):
+                        logger.info(f"消息链长度: {len(message_content.chain)}")
+
+                    sent_ids = await self._send_message_with_attempt_record(
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        source_type=source_type,
+                        source_name=source_name,
+                        message_content=message_content,
+                        related_illust_ids=related_ids,
+                        success_log=f"消息已发送至 {session_id}",
+                        failure_log=f"向 {session_id} 发送消息失败",
+                    )
+                    if sent_ids:
+                        return sent_ids
+
+                    logger.warning(
+                        "随机推送消息发送失败，作品 %s 第 %s/%s 次尝试失败。"
+                        % (
+                            illust_id or "unknown",
+                            attempt,
+                            self.RANDOM_IMAGE_SEND_RETRIES,
+                        )
+                    )
+
+                if not yielded_message:
+                    logger.warning(
+                        "随机推送未生成可发送消息，作品 %s 第 %s/%s 次尝试失败。"
+                        % (
+                            illust_id or "unknown",
+                            attempt,
+                            self.RANDOM_IMAGE_SEND_RETRIES,
+                        )
+                    )
+            except Exception as e:
+                logger.warning(
+                    "随机推送处理作品 %s 第 %s/%s 次尝试异常: %s"
+                    % (
+                        illust_id or "unknown",
+                        attempt,
+                        self.RANDOM_IMAGE_SEND_RETRIES,
+                        e,
+                    )
+                )
+
+            if attempt < self.RANDOM_IMAGE_SEND_RETRIES:
+                await asyncio.sleep(1)
+
+        add_random_search_send_attempt(
+            chat_id=chat_id,
+            session_id=session_id,
+            source_type=source_type,
+            source_name=source_name,
+            illust_id=illust_id,
+            success=False,
+            error_message="图片下载或消息发送连续失败，随机推送已静默回退",
+        )
+        logger.warning(
+            "随机推送作品 %s 连续 %s 次下载或发送失败，准备尝试其他候选作品。"
+            % (illust_id or "unknown", self.RANDOM_IMAGE_SEND_RETRIES)
+        )
+        return set()
+
+    async def _send_random_illusts_with_fallback(
+        self,
+        chat_id: str,
+        session_id: str,
+        source_type: str,
+        source_name: str,
+        initial_illusts,
+        config: FilterConfig,
+    ) -> RandomSearchExecutionResult:
+        filtered_illusts, filter_msgs = filter_illusts_with_reason(
+            initial_illusts, config
+        )
+
+        if not filtered_illusts:
+            if filter_msgs:
+                for msg in filter_msgs:
+                    logger.info(f"随机搜索候选为空: {msg}")
+            else:
+                logger.info("随机搜索候选为空: 共享过滤后无可发送作品")
+            return RandomSearchExecutionResult(had_sendable_candidates=False)
+
+        candidates = list(filtered_illusts)
+        random.shuffle(candidates)
+
+        try:
+            target_count = max(0, int(config.return_count))
+        except (TypeError, ValueError):
+            target_count = 1
+
+        if target_count <= 0:
+            logger.info("随机推送 return_count 小于等于 0，本次无作品发送。")
+            return RandomSearchExecutionResult(had_sendable_candidates=True)
+
+        sent_illust_ids = set()
+        consecutive_failures = 0
+
+        for illust in candidates:
+            if len(sent_illust_ids) >= target_count:
+                break
+
+            sent_ids = await self._send_random_illust_with_retry(
+                chat_id=chat_id,
+                session_id=session_id,
+                source_type=source_type,
+                source_name=source_name,
+                illust=illust,
+                config=config,
+            )
+            if sent_ids:
+                sent_illust_ids.update(sent_ids)
+                consecutive_failures = 0
+                continue
+
+            consecutive_failures += 1
+            if consecutive_failures >= self.RANDOM_IMAGE_FAILURE_STREAK_LIMIT:
+                logger.warning(
+                    "随机推送连续 %s 个候选作品失败，已静默停止本次推送: chat_id=%s, source=%s:%s"
+                    % (
+                        self.RANDOM_IMAGE_FAILURE_STREAK_LIMIT,
+                        chat_id,
+                        source_type,
+                        source_name,
+                    )
+                )
+                break
+
+        for illust_id in sent_illust_ids:
+            add_sent_illust(illust_id, chat_id)
+        if sent_illust_ids:
+            logger.info(f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录")
+
+        return RandomSearchExecutionResult(
+            had_sendable_candidates=True,
+            sent_count=len(sent_illust_ids),
+        )
 
     async def _scheduler_tick(self):
         """
@@ -608,51 +790,17 @@ class RandomSearchService:
             exclude_tags=exclude_tags,
             chat_id=chat_id,
         )
-        if not self._has_sendable_candidates(initial_illusts, config):
-            logger.info(f"标签 {raw_tag} 的随机搜索共享过滤后无可用作品。")
-            return RandomSearchExecutionResult(had_sendable_candidates=False)
-
-        mock_event = self._make_mock_event()
-        sent_illust_ids = set()
-
-        async for message_content, related_illust_ids in process_and_send_illusts(
-            initial_illusts,
-            config,
-            self.client,
-            mock_event,
-            build_detail_message,
-            send_pixiv_image,
-            send_forward_message,
-            is_novel=False,
-            include_related_ids=True,
-        ):
-            if message_content:
-                logger.info(f"准备向 session_id: {session_id} 发送消息")
-                if hasattr(message_content, "chain"):
-                    logger.info(f"消息链长度: {len(message_content.chain)}")
-
-                sent_illust_ids.update(
-                    await self._send_message_with_attempt_record(
-                        chat_id=chat_id,
-                        session_id=session_id,
-                        source_type="tag",
-                        source_name=raw_tag,
-                        message_content=message_content,
-                        related_illust_ids=related_illust_ids,
-                        success_log=f"消息已发送至 {session_id}",
-                        failure_log=f"向 {session_id} 发送消息失败",
-                    )
-                )
-
-        for illust_id in sent_illust_ids:
-            add_sent_illust(illust_id, chat_id)
-        if sent_illust_ids:
-            logger.info(f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录")
-
-        return RandomSearchExecutionResult(
-            had_sendable_candidates=True,
-            sent_count=len(sent_illust_ids),
+        result = await self._send_random_illusts_with_fallback(
+            chat_id=chat_id,
+            session_id=session_id,
+            source_type="tag",
+            source_name=raw_tag,
+            initial_illusts=initial_illusts,
+            config=config,
         )
+        if not result.had_sendable_candidates:
+            logger.info(f"标签 {raw_tag} 的随机搜索共享过滤后无可用作品。")
+        return result
 
     async def _execute_tag_search(
         self, chat_id: str, selected_tag_entry
@@ -803,48 +951,17 @@ class RandomSearchService:
                 exclude_tags=[],
                 chat_id=chat_id,
             )
-            if not self._has_sendable_candidates(initial_illusts, config):
-                logger.info(f"排行榜 {mode} 的随机搜索共享过滤后无可用作品。")
-                return RandomSearchExecutionResult(had_sendable_candidates=False)
-
-            mock_event = self._make_mock_event()
-            sent_illust_ids = set()
-
-            async for message_content, related_illust_ids in process_and_send_illusts(
-                initial_illusts,
-                config,
-                self.client,
-                mock_event,
-                build_detail_message,
-                send_pixiv_image,
-                send_forward_message,
-                is_novel=False,
-                include_related_ids=True,
-            ):
-                if message_content:
-                    sent_illust_ids.update(
-                        await self._send_message_with_attempt_record(
-                            chat_id=chat_id,
-                            session_id=session_id,
-                            source_type="ranking",
-                            source_name=mode,
-                            message_content=message_content,
-                            related_illust_ids=related_illust_ids,
-                            success_log=f"排行榜消息已发送至 {session_id}",
-                            failure_log=f"向 {session_id} 发送排行榜消息失败",
-                        )
-                    )
-
-            for illust_id in sent_illust_ids:
-                add_sent_illust(illust_id, chat_id)
-            if sent_illust_ids:
-                logger.info(
-                    f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个排行榜作品的发送记录"
-                )
-            return RandomSearchExecutionResult(
-                had_sendable_candidates=True,
-                sent_count=len(sent_illust_ids),
+            result = await self._send_random_illusts_with_fallback(
+                chat_id=chat_id,
+                session_id=session_id,
+                source_type="ranking",
+                source_name=mode,
+                initial_illusts=initial_illusts,
+                config=config,
             )
+            if not result.had_sendable_candidates:
+                logger.info(f"排行榜 {mode} 的随机搜索共享过滤后无可用作品。")
+            return result
 
         except Exception as e:
             logger.error(f"为群组 {chat_id} 执行随机排行榜搜索时出错: {e}")

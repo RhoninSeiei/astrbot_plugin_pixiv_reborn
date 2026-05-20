@@ -59,3 +59,26 @@ def enforce_random_push_delivery_policy(filter_config_kwargs):
     normalized["single_response_mode"] = False
     normalized["forward_threshold"] = False
     return normalized
+
+
+def is_random_push_image_failure_notice(message_content):
+    """Detect fallback text that should not be sent by scheduled random pushes."""
+    failure_markers = (
+        "图片下载失败",
+        "动图处理失败",
+        "处理动图时发生错误",
+    )
+    texts = []
+
+    chain = getattr(message_content, "chain", None)
+    if isinstance(chain, (list, tuple)):
+        for item in chain:
+            for attr in ("text", "message", "content"):
+                value = getattr(item, attr, None)
+                if isinstance(value, str):
+                    texts.append(value)
+            texts.append(str(item))
+    else:
+        texts.append(str(message_content))
+
+    return any(marker in text for text in texts for marker in failure_markers)

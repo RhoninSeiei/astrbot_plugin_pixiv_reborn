@@ -3,8 +3,19 @@ import unittest
 from utils.random_empty_retry import (
     build_retry_source_sequence,
     enforce_random_push_delivery_policy,
+    is_random_push_image_failure_notice,
     resolve_retry_depth,
 )
+
+
+class FakePlain:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeMessageChain:
+    def __init__(self, chain):
+        self.chain = chain
 
 
 class RandomSearchEmptyRetryTest(unittest.TestCase):
@@ -70,6 +81,18 @@ class RandomSearchEmptyRetryTest(unittest.TestCase):
         self.assertFalse(normalized["forward_threshold"])
         self.assertEqual(normalized["return_count"], 3)
         self.assertTrue(config_kwargs["single_response_mode"])
+
+    def test_image_failure_notice_is_detected_from_message_chain(self):
+        message = FakeMessageChain(
+            [FakePlain("图片下载失败，仅发送信息：\n标题: 時雨")]
+        )
+
+        self.assertTrue(is_random_push_image_failure_notice(message))
+
+    def test_normal_detail_message_is_not_detected_as_failure_notice(self):
+        message = FakeMessageChain([FakePlain("标题: 時雨\n链接: https://example.com")])
+
+        self.assertFalse(is_random_push_image_failure_notice(message))
 
 
 if __name__ == "__main__":
