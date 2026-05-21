@@ -122,7 +122,7 @@ class PixivConfig:
         self.refresh_interval = self.config.get("refresh_token_interval_minutes", 180)
         self.subscription_enabled = self.config.get("subscription_enabled", True)
         self.subscription_force_forward = self.config.get(
-            "subscription_force_forward", True
+            "subscription_force_forward", False
         )
         self.subscription_check_interval_minutes = self.config.get(
             "subscription_check_interval_minutes", 30
