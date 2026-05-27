@@ -420,6 +420,17 @@ class RandomSearchService:
         filtered_illusts, filter_msgs = filter_illusts_with_reason(
             initial_illusts, config
         )
+        logger.info(
+            "随机搜索条件过滤统计: 群组 %s, 来源 %s:%s, 待过滤 %s 个，通过 %s 个，剔除 %s 个。"
+            % (
+                chat_id,
+                source_type,
+                source_name,
+                len(initial_illusts),
+                len(filtered_illusts),
+                len(initial_illusts) - len(filtered_illusts),
+            )
+        )
 
         if not filtered_illusts:
             if filter_msgs:
@@ -697,7 +708,9 @@ class RandomSearchService:
             if result.had_sendable_candidates:
                 return result.sent_count
 
-        await self._send_no_result_notice(chat_id, first_option)
+        logger.info(
+            f"群组 {chat_id}: 随机搜索所有来源均无可发送作品，已静默结束本次任务"
+        )
         return 0
 
     def _option_name(self, option) -> str:
@@ -780,6 +793,15 @@ class RandomSearchService:
         all_illusts,
     ) -> RandomSearchExecutionResult:
         initial_illusts = filter_sent_illusts(all_illusts, chat_id)
+        logger.info(
+            "标签 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"
+            % (
+                raw_tag,
+                len(all_illusts),
+                len(all_illusts) - len(initial_illusts),
+                len(initial_illusts),
+            )
+        )
 
         if not initial_illusts:
             logger.info(f"标签 {raw_tag} 的随机搜索过滤已发送记录后无可用作品。")
@@ -864,14 +886,13 @@ class RandomSearchService:
             if result.had_sendable_candidates:
                 return result
 
-            retry_depth = resolve_retry_depth(
-                deep_search_depth, self._empty_retry_extra_depth()
-            )
-            if (
-                self._empty_retry_enabled()
-                and retry_depth != deep_search_depth
-                and next_params
-            ):
+            current_depth = deep_search_depth
+            while self._empty_retry_enabled() and next_params:
+                retry_depth = resolve_retry_depth(
+                    current_depth, self._empty_retry_extra_depth()
+                )
+                if retry_depth == current_depth:
+                    break
                 logger.info(
                     f"标签 {raw_tag} 在前 {page_count} 页无可发送作品，扩大搜索范围到 {retry_depth} 页"
                 )
@@ -886,7 +907,7 @@ class RandomSearchService:
                 logger.info(
                     f"标签 {raw_tag} 的扩大搜索完成，共获取 {page_count} 页，找到 {len(all_illusts)} 个插画，重新过滤处理..."
                 )
-                return await self._send_tag_search_results(
+                result = await self._send_tag_search_results(
                     chat_id,
                     session_id,
                     raw_tag,
@@ -894,6 +915,9 @@ class RandomSearchService:
                     exclude_tags,
                     all_illusts,
                 )
+                if result.had_sendable_candidates:
+                    return result
+                current_depth = retry_depth
 
             return result
 
@@ -940,7 +964,17 @@ class RandomSearchService:
                     )
 
             # 过滤已发送的作品
+            before_sent_filter_count = len(initial_illusts)
             initial_illusts = filter_sent_illusts(initial_illusts, chat_id)
+            logger.info(
+                "排行榜 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"
+                % (
+                    mode,
+                    before_sent_filter_count,
+                    before_sent_filter_count - len(initial_illusts),
+                    len(initial_illusts),
+                )
+            )
 
             if not initial_illusts:
                 logger.info(f"排行榜 {mode} 的随机搜索过滤后无可用作品。")

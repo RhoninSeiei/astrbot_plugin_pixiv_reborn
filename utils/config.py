@@ -285,7 +285,7 @@ class PixivConfigManager:
             "random_search_empty_retry_extra_depth": {
                 "type": "int",
                 "min": 0,
-                "max": 10,
+                "max": 30,
             },
             "random_search_empty_retry_sources": {"type": "int", "min": 0, "max": 10},
             "proxy": {"type": "string", "hidden": True},

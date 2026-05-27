@@ -1,7 +1,7 @@
 import random
 
 
-DEFAULT_RETRY_DEPTH_CAP = 10
+DEFAULT_RETRY_DEPTH_CAP = 30
 
 
 def _coerce_non_negative_int(value, default=0):

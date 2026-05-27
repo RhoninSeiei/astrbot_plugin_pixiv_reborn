@@ -68,6 +68,34 @@ class FakeIllust:
         self.type = "illust"
 
 
+class FakeSearchResult:
+    def __init__(self, illusts, next_url=None):
+        self.illusts = illusts
+        self.next_url = next_url
+
+
+class FakeSearchClient:
+    def __init__(self, final_page_with_candidates):
+        self.calls = []
+        self.final_page_with_candidates = final_page_with_candidates
+
+    def search_illust(self, **params):
+        page = int(params.get("page", 1))
+        self.calls.append(page)
+        first_id = page * 1000
+        illusts = [FakeIllust(first_id + index) for index in range(30)]
+        next_url = f"page={page + 1}" if page < self.final_page_with_candidates else None
+        return FakeSearchResult(illusts, next_url=next_url)
+
+    def parse_qs(self, next_url):
+        return {"page": int(next_url.split("=", 1)[1])}
+
+
+class FakeClientWrapper:
+    async def authenticate(self):
+        return True
+
+
 def install_import_stubs(data_dir):
     astrbot = types.ModuleType("astrbot")
     astrbot_api = types.ModuleType("astrbot.api")
@@ -125,6 +153,25 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             ai_filter_mode="显示 AI 作品",
             return_count=return_count,
             show_details=True,
+        )
+
+    def _make_pixiv_config(self):
+        return types.SimpleNamespace(
+            r18_mode="过滤 R18",
+            filter_r18g_only=False,
+            ai_filter_mode="显示 AI 作品",
+            ai_detection_mode="field_or_tag",
+            show_filter_result=False,
+            single_response_mode=False,
+            forward_threshold=False,
+            show_details=True,
+            return_count=1,
+            random_search_min_interval=30,
+            random_search_max_interval=240,
+            deep_search_depth=3,
+            random_search_empty_retry_enabled=True,
+            random_search_empty_retry_extra_depth=3,
+            random_search_empty_retry_sources=0,
         )
 
     async def _run_with_patches(self, fail_ids, return_count):
@@ -225,9 +272,124 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             [1, 2],
         )
 
+    async def test_tag_search_keeps_expanding_until_candidate_is_found(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            client = FakeSearchClient(final_page_with_candidates=7)
+            sent_records = []
+
+            async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+                yield event.plain_result(f"标题: {illust.title}")
+
+            def fake_filter_sent_illusts(illusts, chat_id):
+                return [illust for illust in illusts if illust.id >= 7000]
+
+            originals = {
+                "send_pixiv_image": random_search.send_pixiv_image,
+                "filter_sent_illusts": random_search.filter_sent_illusts,
+                "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
+                "get_random_search_group_config": random_search.get_random_search_group_config,
+                "add_random_search_send_attempt": random_search.add_random_search_send_attempt,
+                "add_sent_illust": random_search.add_sent_illust,
+                "shuffle": random_search.random.shuffle,
+                "sleep": random_search.asyncio.sleep,
+            }
+
+            random_search.send_pixiv_image = fake_send_pixiv_image
+            random_search.filter_sent_illusts = fake_filter_sent_illusts
+            random_search.filter_illusts_with_reason = (
+                lambda illusts, config: (list(illusts), [])
+            )
+            random_search.get_random_search_group_config = lambda chat_id: None
+            random_search.add_random_search_send_attempt = lambda **kwargs: None
+            random_search.add_sent_illust = (
+                lambda illust_id, chat_id: sent_records.append((illust_id, chat_id))
+            )
+            random_search.random.shuffle = lambda items: None
+            random_search.asyncio.sleep = lambda delay: _noop_async()
+
+            try:
+                service = object.__new__(random_search.RandomSearchService)
+                service.client_wrapper = FakeClientWrapper()
+                service.client = client
+                service.pixiv_config = self._make_pixiv_config()
+                service.context = FakeContext()
+
+                result = await service._execute_tag_search(
+                    "172448191",
+                    types.SimpleNamespace(
+                        tag="時雨(艦隊これくしょん)",
+                        session_id="default:GroupMessage:172448191",
+                    ),
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "shuffle" else random_search.asyncio
+                        if name == "sleep"
+                        else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertEqual(client.calls, [1, 2, 3, 4, 5, 6, 7])
+            self.assertTrue(result.had_sendable_candidates)
+            self.assertEqual(result.sent_count, 1)
+            self.assertEqual(len(service.context.sent_messages), 1)
+            self.assertEqual(sent_records, [(7000, "172448191")])
+
+    async def test_random_push_empty_result_is_silent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = object.__new__(random_search.RandomSearchService)
+            service.context = FakeContext()
+            service._empty_retry_enabled = lambda: False
+            service._execute_tag_search = lambda chat_id, tag: _result_async(
+                random_search.RandomSearchExecutionResult(
+                    had_sendable_candidates=False
+                )
+            )
+
+            originals = {
+                "get_random_tags": random_search.get_random_tags,
+                "get_random_rankings": random_search.get_random_rankings,
+                "choice": random_search.random.choice,
+                "add_random_search_send_attempt": random_search.add_random_search_send_attempt,
+            }
+            random_search.get_random_tags = lambda chat_id: [
+                types.SimpleNamespace(
+                    tag="時雨(艦隊これくしょん)",
+                    session_id="default:GroupMessage:172448191",
+                )
+            ]
+            random_search.get_random_rankings = lambda chat_id: []
+            random_search.random.choice = lambda options: options[0]
+            random_search.add_random_search_send_attempt = lambda **kwargs: None
+
+            try:
+                sent_count = await service.execute_search_for_group("172448191")
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "choice" else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertEqual(sent_count, 0)
+            self.assertEqual(service.context.sent_messages, [])
+
 
 async def _noop_async():
     return None
+
+
+async def _result_async(result):
+    return result
 
 
 if __name__ == "__main__":

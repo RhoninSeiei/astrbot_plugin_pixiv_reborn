@@ -277,10 +277,10 @@
   "random_search_empty_retry_extra_depth": {
       "description": "随机搜索空结果额外页数",
       "type": "int",
-      "hint": "tag 随机搜索筛选为空时临时增加的页数。默认 3 表示 deep_search_depth=3 时最多扩大到 6 页，上限 10 页。",
+      "hint": "tag 随机搜索筛选为空时每轮临时增加的页数。默认 3 表示 deep_search_depth=3 时按 3、6、9 页持续扩大，上限 30 页。",
       "default": 3,
       "min": 0,
-      "max": 10
+      "max": 30
   },
   "random_search_empty_retry_sources": {
       "description": "随机搜索空结果补抽来源数",

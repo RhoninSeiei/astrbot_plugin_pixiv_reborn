@@ -21,8 +21,8 @@ class FakeMessageChain:
 class RandomSearchEmptyRetryTest(unittest.TestCase):
     def test_retry_depth_expands_positive_depth_with_cap(self):
         self.assertEqual(resolve_retry_depth(3, 3), 6)
-        self.assertEqual(resolve_retry_depth(9, 5), 10)
-        self.assertEqual(resolve_retry_depth(20, 5), 20)
+        self.assertEqual(resolve_retry_depth(9, 5), 14)
+        self.assertEqual(resolve_retry_depth(27, 5), 30)
 
     def test_retry_depth_does_not_expand_unlimited_or_disabled_values(self):
         self.assertEqual(resolve_retry_depth(-1, 3), -1)
