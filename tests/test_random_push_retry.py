@@ -55,6 +55,28 @@ class FakeContext:
         self.sent_messages.append((session_id, message_content))
 
 
+class FakeActionFailedTimeout(Exception):
+    retcode = 1200
+    status = "failed"
+    message = (
+        "Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg "
+        "ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet:\n"
+        "{\n"
+        "    \"result\": 0,\n"
+        "    \"errMsg\": \"\"\n"
+        "}\n"
+    )
+    wording = message
+
+    def __str__(self):
+        return self.message
+
+
+class FakeTimeoutContext:
+    async def send_message(self, session_id, message_content):
+        raise FakeActionFailedTimeout()
+
+
 class FakeUser:
     name = "artist"
 
@@ -193,7 +215,9 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             originals = {
                 "send_pixiv_image": random_search.send_pixiv_image,
                 "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
-                "add_random_search_send_attempt": random_search.add_random_search_send_attempt,
+                "add_random_search_send_attempt": (
+                    random_search.add_random_search_send_attempt
+                ),
                 "add_sent_illust": random_search.add_sent_illust,
                 "shuffle": random_search.random.shuffle,
                 "sleep": random_search.asyncio.sleep,
@@ -272,6 +296,47 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             [1, 2],
         )
 
+    async def test_send_timeout_with_success_eventret_is_treated_as_accepted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            attempts = []
+            originals = {
+                "add_random_search_send_attempt": (
+                    random_search.add_random_search_send_attempt
+                ),
+                "cleanup_pixiv_temp_files": random_search.cleanup_pixiv_temp_files,
+            }
+            random_search.add_random_search_send_attempt = (
+                lambda **kwargs: attempts.append(kwargs)
+            )
+            random_search.cleanup_pixiv_temp_files = (
+                lambda message_content: _noop_async()
+            )
+
+            try:
+                service = self._make_service(random_search)
+                service.context = FakeTimeoutContext()
+                sent_ids = await service._send_message_with_attempt_record(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="時雨(艦隊これくしょん)",
+                    message_content=FakeMessageChain().message("标题: timeout"),
+                    related_illust_ids=[73092032],
+                    success_log="消息已发送",
+                    failure_log="发送失败",
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(random_search, name, value)
+
+            self.assertEqual(sent_ids, {73092032})
+            self.assertEqual(len(attempts), 1)
+            self.assertTrue(attempts[0]["success"])
+            self.assertEqual(attempts[0]["illust_id"], 73092032)
+
     async def test_tag_search_keeps_expanding_until_candidate_is_found(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             install_import_stubs(temp_dir)
@@ -291,7 +356,9 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
                 "filter_sent_illusts": random_search.filter_sent_illusts,
                 "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
                 "get_random_search_group_config": random_search.get_random_search_group_config,
-                "add_random_search_send_attempt": random_search.add_random_search_send_attempt,
+                "add_random_search_send_attempt": (
+                    random_search.add_random_search_send_attempt
+                ),
                 "add_sent_illust": random_search.add_sent_illust,
                 "shuffle": random_search.random.shuffle,
                 "sleep": random_search.asyncio.sleep,
@@ -358,7 +425,9 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
                 "get_random_tags": random_search.get_random_tags,
                 "get_random_rankings": random_search.get_random_rankings,
                 "choice": random_search.random.choice,
-                "add_random_search_send_attempt": random_search.add_random_search_send_attempt,
+                "add_random_search_send_attempt": (
+                    random_search.add_random_search_send_attempt
+                ),
             }
             random_search.get_random_tags = lambda chat_id: [
                 types.SimpleNamespace(

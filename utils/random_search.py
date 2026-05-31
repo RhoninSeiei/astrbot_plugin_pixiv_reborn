@@ -237,6 +237,28 @@ class RandomSearchService:
 
         return MockEvent()
 
+    def _is_send_timeout_after_accept(self, error) -> bool:
+        """判断 QQ sendMsg 是否在受理后等待消息更新回执超时。"""
+        text_parts = [repr(error), str(error)]
+        for attr in ("retcode", "message", "wording", "status"):
+            value = getattr(error, attr, None)
+            if value is not None:
+                text_parts.append(str(value))
+        text = chr(10).join(text_parts).replace('\\"', '"')
+        compact_text = "".join(text.split())
+
+        has_timeout_retcode = (
+            getattr(error, "retcode", None) == 1200
+            or "retcode=1200" in text
+            or "retcode': 1200" in text
+            or '"retcode": 1200' in text
+        )
+        has_send_timeout = "Timeout:" in text and "sendMsg" in text
+        has_success_event = (
+            '"result":0' in compact_text and '"errMsg":""' in compact_text
+        )
+        return has_timeout_retcode and has_send_timeout and has_success_event
+
     async def _send_message_with_attempt_record(
         self,
         chat_id: str,
@@ -278,6 +300,21 @@ class RandomSearchService:
             logger.info(success_log)
             return set(illust_ids)
         except Exception as e:
+            if self._is_send_timeout_after_accept(e):
+                for illust_id in attempt_illust_ids:
+                    add_random_search_send_attempt(
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        source_type=source_type,
+                        source_name=source_name,
+                        illust_id=illust_id,
+                        success=True,
+                    )
+                logger.warning(
+                    f"{failure_log}: QQ sendMsg 已受理但等待消息更新回执超时，按已发送处理: {e}"
+                )
+                return set(illust_ids)
+
             for illust_id in attempt_illust_ids:
                 add_random_search_send_attempt(
                     chat_id=chat_id,
