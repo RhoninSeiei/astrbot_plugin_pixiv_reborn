@@ -185,7 +185,8 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(props["count"]["maximum"], 5)
         self.assertEqual(props["filters"]["default"], "safe")
 
-    def test_registered_tool_object_identity_is_shared_by_tool_sets(self):
+    def test_registered_tool_object_identity_is_shared_across_llm_request(self):
+        from astrbot.core.platform.astr_message_event import AstrMessageEvent
         from astrbot.core.provider.func_tool_manager import FunctionToolManager
 
         tools = self.llm_tool.create_pixiv_llm_tools(
@@ -197,9 +198,15 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         manager = FunctionToolManager()
         manager.func_list.extend(tools)
         request_tool_set = manager.get_full_tool_set()
+        event = object.__new__(AstrMessageEvent)
+        req = event.request_llm(
+            prompt="pixiv tool request",
+            tool_set=request_tool_set,
+        )
 
         self.assertIs(manager.get_func("pixiv_search_illust"), pixiv_tool)
         self.assertIs(request_tool_set.get_tool("pixiv_search_illust"), pixiv_tool)
+        self.assertIs(req.func_tool.get_tool("pixiv_search_illust"), pixiv_tool)
 
     async def test_call_uses_candidate_tags_and_sends_images_in_event_context(self):
         from astrbot.core.agent.run_context import ContextWrapper
