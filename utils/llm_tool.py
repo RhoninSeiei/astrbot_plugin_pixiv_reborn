@@ -16,12 +16,58 @@ from .tag import (
     build_detail_message,
     FilterConfig,
     filter_illusts_with_reason,
-    process_and_send_illusts_sorted,
+    validate_and_process_tags,
 )
 from .pixiv_utils import (
     send_pixiv_image,
-    send_forward_message,
     generate_safe_filename,
+)
+from .random_empty_retry import is_random_push_image_failure_notice
+
+
+PIXIV_TAG_ALIASES = [
+    (("舰队收藏", "艦隊收藏", "舰队collection", "kancolle"), "艦隊これくしょん"),
+    (("舰c", "艦c", "舰これ", "艦これ"), "艦これ"),
+    (("亚特兰大", "亞特蘭大", "atlanta"), "Atlanta(艦隊これくしょん)"),
+    (("时雨", "時雨", "shigure"), "時雨(艦隊これくしょん)"),
+    (("响", "響", "hibiki"), "響(艦隊これくしょん)"),
+    (("伊莉雅", "伊莉亚", "依莉雅", "illya"), "イリヤスフィール・フォン・アインツベルン"),
+    (("伊蕾娜", "イレイナ", "elaina"), "イレイナ"),
+    (("碧蓝航线", "碧藍航線", "azur lane"), "アズールレーン"),
+    (("勒马兰", "勒馬蘭", "le malin"), "ル・マラン(アズールレーン)"),
+    (("碧蓝档案", "蔚蓝档案", "ブルアカ", "blue archive"), "ブルーアーカイブ"),
+    (("梦幻之星在线2", "夢幻之星在線2", "pso2"), "ファンタシースターオンライン2"),
+    (("艾梅斯", "エイメス", "aimess"), "エイメス"),
+]
+
+PIXIV_WORK_TAGS = {
+    "艦隊これくしょん",
+    "艦これ",
+    "アズールレーン",
+    "ブルーアーカイブ",
+    "ファンタシースターオンライン2",
+}
+
+PIXIV_QUERY_FILLERS = (
+    "来点",
+    "來點",
+    "发点",
+    "發點",
+    "发张",
+    "發張",
+    "给我",
+    "給我",
+    "图片",
+    "圖片",
+    "插画",
+    "插圖",
+    "壁纸",
+    "壁紙",
+    "pixiv",
+    "搜索",
+    "搜",
+    "的图",
+    "的圖",
 )
 
 
@@ -36,10 +82,10 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     pixiv_client_wrapper: Any = None
     name: str = "pixiv_search_illust"
     description: str = (
-        "【图片/插画搜索专用工具】用于在Pixiv上搜索二次元插画、动漫图片、壁纸等。"
-        "当用户想要：搜图、找图、来张图、发张图、看图、要壁纸、找插画、"
-        "搜索某个角色/作品的图片（如'初音未来的图'、'原神壁纸'）时，必须使用此工具。"
-        "此工具专门返回图片，不是网页搜索。任何涉及图片、插画、二次元图的请求都应优先使用本工具。"
+        "根据自然语言、作品名、角色名、Pixiv tag 或 tag 候选列表搜索 Pixiv 插画，"
+        "并在当前事件上下文中发送图片。工具内部会做 Pixiv tag 规范化、别名转换、"
+        "常用日文标签补全、角色名与作品名组合搜索和失败降级。"
+        "返回给 Agent 的文本只描述执行状态。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -47,23 +93,31 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "搜索关键词或标签，直接使用用户输入的原文。例如：初音ミク、原神、可爱女孩等",
+                    "description": "原始搜索词或自然语言请求，例如作品名、角色名、Pixiv tag 或群聊请求文本。",
                 },
                 "count": {
                     "type": "integer",
-                    "description": (
-                        "【必填】返回图片数量。"
-                        "必须根据用户请求的数量填写！"
-                        "例如：'来两张图'→count=2，'给我三张'→count=3，'来点图'→count=3。"
-                        "如果用户没有明确说数量，默认设为1。最小1，最大5。"
-                    ),
+                    "description": "期望返回数量，默认 1，最大 5。",
                     "minimum": 1,
                     "maximum": 5,
                     "default": 1,
                 },
                 "filters": {
                     "type": "string",
-                    "description": "过滤条件：'safe'(全年龄)、'r18'(限制级)。默认为safe",
+                    "description": "过滤条件：safe 或 r18，默认 safe。",
+                    "enum": ["safe", "r18"],
+                    "default": "safe",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选，调用方提供的候选 Pixiv tag 列表。",
+                    "default": [],
+                },
+                "source_text": {
+                    "type": "string",
+                    "description": "可选，群聊原始请求文本，用于内部二次解析。",
+                    "default": "",
                 },
             },
             "required": ["query"],
@@ -74,9 +128,15 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
         try:
-            query = kwargs.get("query", "")
-            count = min(max(int(kwargs.get("count", 1)), 1), 5)
-            logger.info(f"Pixiv插画搜索工具：搜索 '{query}'，数量: {count}")
+            query = str(kwargs.get("query", "") or "").strip()
+            source_text = str(kwargs.get("source_text", "") or "").strip()
+            count = self._normalize_count(kwargs.get("count", 1))
+            filters = self._normalize_filters(kwargs.get("filters", "safe"))
+            tags = self._normalize_tags(kwargs.get("tags"))
+            logger.info(
+                "ToolLoopAgentRunner 执行 pixiv_search_illust: query=%r, count=%s, filters=%s, tags=%s"
+                % (query, count, filters, tags)
+            )
 
             if not self.pixiv_client:
                 return "错误: Pixiv客户端未初始化"
@@ -91,79 +151,226 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                     return self.pixiv_config.get_auth_error_message()
                 return "Pixiv API 认证失败，请检查配置中的凭据信息。"
 
-            tags = query.strip()
-            return await self._search_illust(tags, query, context, count)
+            candidates = self._build_search_candidates(query, tags, source_text)
+            if not candidates:
+                return "未找到可用的 Pixiv 搜索词"
+
+            return await self._search_illust(candidates, query, context, count, filters)
 
         except Exception as e:
-            logger.error(f"Pixiv插画搜索失败: {e}")
+            logger.error(f"Pixiv插画搜索失败: {e}", exc_info=True)
             return f"搜索失败: {str(e)}"
 
-    async def _search_illust(self, tags, query, context, count=1):
-        """按热度（收藏数）搜索插画 - 一周内"""
+    def _normalize_count(self, value) -> int:
+        try:
+            return min(max(int(value), 1), 5)
+        except (TypeError, ValueError):
+            return 1
+
+    def _normalize_filters(self, value) -> str:
+        normalized = str(value or "safe").strip().lower()
+        return "r18" if normalized == "r18" else "safe"
+
+    def _normalize_tags(self, value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = [item.strip() for item in value.replace("，", ",").split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = [str(item).strip() for item in value]
+        else:
+            raw_items = []
+
+        normalized = []
+        for item in raw_items:
+            if not item:
+                continue
+            normalized.append(self._normalize_alias_tag(item) or item)
+        return self._dedupe(normalized)
+
+    def _normalize_alias_tag(self, text: str) -> str | None:
+        normalized_text = text.strip().lower()
+        for aliases, tag in PIXIV_TAG_ALIASES:
+            if normalized_text == tag.lower():
+                return tag
+            if any(normalized_text == alias.lower() for alias in aliases):
+                return tag
+        return None
+
+    def _extract_alias_tags(self, text: str) -> list[str]:
+        lowered = text.lower()
+        tags = []
+        for aliases, tag in PIXIV_TAG_ALIASES:
+            if tag.lower() in lowered or any(alias.lower() in lowered for alias in aliases):
+                tags.append(tag)
+        return self._dedupe(tags)
+
+    def _clean_query_text(self, text: str) -> str:
+        cleaned = text.strip()
+        for filler in PIXIV_QUERY_FILLERS:
+            cleaned = cleaned.replace(filler, " ")
+        return " ".join(cleaned.replace("，", " ").replace(",", " ").split())
+
+    def _dedupe(self, values: list[str]) -> list[str]:
+        result = []
+        seen = set()
+        for value in values:
+            key = value.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(value.strip())
+        return result
+
+    def _build_search_candidates(
+        self, query: str, tags: list[str] | None = None, source_text: str = ""
+    ) -> list[dict[str, str]]:
+        raw_text = " ".join(item for item in [query, source_text] if item).strip()
+        normalized_tags = self._normalize_tags(tags or [])
+        alias_tags = self._extract_alias_tags(raw_text)
+        loose_query = self._clean_query_text(raw_text)
+
+        known_tags = self._dedupe(normalized_tags + alias_tags)
+        work_tags = [tag for tag in known_tags if tag in PIXIV_WORK_TAGS]
+        character_tags = [tag for tag in known_tags if tag not in PIXIV_WORK_TAGS]
+
+        exact_tags = character_tags + work_tags
+        candidates: list[dict[str, str]] = []
+
+        for tag in exact_tags:
+            candidates.append(
+                {
+                    "word": tag,
+                    "search_target": "exact_match_for_tags",
+                    "label": tag,
+                }
+            )
+
+        for work_tag in work_tags:
+            for character_tag in character_tags:
+                candidates.append(
+                    {
+                        "word": f"{work_tag} {character_tag}",
+                        "search_target": "partial_match_for_tags",
+                        "label": f"{work_tag} + {character_tag}",
+                    }
+                )
+
+        for tag in exact_tags:
+            candidates.append(
+                {
+                    "word": tag,
+                    "search_target": "partial_match_for_tags",
+                    "label": tag,
+                }
+            )
+
+        if loose_query:
+            candidates.append(
+                {
+                    "word": loose_query,
+                    "search_target": "partial_match_for_tags",
+                    "label": loose_query,
+                }
+            )
+
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            key = (candidate["word"].lower(), candidate["search_target"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
+
+    async def _search_illust(
+        self, candidates, query, context, count=1, filters: str = "safe"
+    ):
+        """按候选 tag 逐级搜索插画。"""
         import asyncio
 
-        all_illusts = []
-        page_count = 0
-        next_params = None
-        pages_to_fetch = 5
+        for candidate in candidates:
+            tag_result = validate_and_process_tags(candidate["word"])
+            if not tag_result["success"]:
+                logger.warning(
+                    f"pixiv_search_illust 跳过无效候选 tag: {candidate['word']}"
+                )
+                continue
 
-        while page_count < pages_to_fetch:
-            try:
-                if page_count == 0:
-                    search_result = await asyncio.to_thread(
-                        self.pixiv_client.search_illust,
-                        tags,
-                        search_target="partial_match_for_tags",
-                        sort="date_desc",
-                        filter="for_ios",
-                        duration="within_last_week",  # 一周内
-                    )
-                else:
-                    if not next_params:
+            search_word = tag_result["search_tags"]
+            search_target = candidate["search_target"]
+            all_illusts = []
+            page_count = 0
+            next_params = None
+            pages_to_fetch = 3
+
+            while page_count < pages_to_fetch:
+                try:
+                    if page_count == 0:
+                        search_result = await asyncio.to_thread(
+                            self.pixiv_client.search_illust,
+                            search_word,
+                            search_target=search_target,
+                            sort="popular_desc",
+                            filter="for_ios",
+                            req_auth=True,
+                        )
+                    else:
+                        if not next_params:
+                            break
+                        search_result = await asyncio.to_thread(
+                            self.pixiv_client.search_illust, **next_params
+                        )
+
+                    if not search_result or not hasattr(search_result, "illusts"):
                         break
-                    search_result = await asyncio.to_thread(
-                        self.pixiv_client.search_illust, **next_params
+
+                    if search_result.illusts:
+                        all_illusts.extend(search_result.illusts)
+                        page_count += 1
+                    else:
+                        break
+
+                    if hasattr(search_result, "next_url") and search_result.next_url:
+                        next_params = self.pixiv_client.parse_qs(search_result.next_url)
+                    else:
+                        break
+
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    logger.warning(
+                        "pixiv_search_illust 候选 %r 搜索失败: %s"
+                        % (search_word, e)
                     )
-
-                if not search_result or not hasattr(search_result, "illusts"):
                     break
 
-                if search_result.illusts:
-                    all_illusts.extend(search_result.illusts)
-                    page_count += 1
-                else:
-                    break
+            if not all_illusts:
+                logger.info(f"pixiv_search_illust 候选 {search_word!r} 未找到结果")
+                continue
 
-                if hasattr(search_result, "next_url") and search_result.next_url:
-                    next_params = self.pixiv_client.parse_qs(search_result.next_url)
-                else:
-                    break
-
-                await asyncio.sleep(0.2)
-            except Exception as e:
-                logger.error(f"热度搜索第 {page_count + 1} 页出错: {e}")
-                break
-
-        if not all_illusts:
-            return f"未找到关于 '{query}' 的插画。"
-
-        sorted_illusts = sorted(
-            all_illusts, key=lambda x: getattr(x, "total_bookmarks", 0), reverse=True
-        )
-
-        event = self._get_event(context)
-        if event:
-            return await self._send_pixiv_result(
-                event, sorted_illusts, query, tags, count
+            sorted_illusts = sorted(
+                all_illusts,
+                key=lambda x: getattr(x, "total_bookmarks", 0),
+                reverse=True,
             )
-        else:
-            return self._format_text_results(sorted_illusts, query, tags)
+            event = self._get_event(context)
+            return await self._send_pixiv_result(
+                event, sorted_illusts, query, search_word, count, filters
+            )
 
-    async def _send_pixiv_result(self, event, items, query, tags, count=1):
-        """发送按热度排序的结果"""
+        return "未找到可发送图片"
+
+    async def _send_pixiv_result(
+        self, event, items, query, tags, count=1, filters: str = "safe"
+    ):
+        """发送按热度排序的结果，并只返回执行状态。"""
         logger.info(f"PixivIllustSearchTool: 准备发送 {count} 张图片")
+        if not event or not hasattr(event, "send"):
+            return "未找到当前事件上下文，无法发送图片"
+
         config = FilterConfig(
-            r18_mode=self.pixiv_config.r18_mode if self.pixiv_config else "过滤 R18",
+            r18_mode="仅 R18" if filters == "r18" else "过滤 R18",
             filter_r18g_only=self.pixiv_config.filter_r18g_only
             if self.pixiv_config
             else False,
@@ -189,42 +396,38 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
 
         filtered_items, _ = filter_illusts_with_reason(items, config)
         if not filtered_items:
-            return "找到插画但被过滤了 (可能是R18或AI作品)。"
+            return "未找到可发送图片"
 
-        if not hasattr(event, "send"):
-            return self._format_text_results(filtered_items, query, tags)
-
-        expected_count = min(len(filtered_items), config.return_count)
-        sent_batches = 0
-
-        try:
-            async for result in process_and_send_illusts_sorted(
-                items,
-                config,
-                self.pixiv_client,
-                event,
-                build_detail_message,
-                send_pixiv_image,
-                send_forward_message,
-                is_novel=False,
-            ):
-                try:
+        sent_count = 0
+        for illust in filtered_items:
+            if sent_count >= config.return_count:
+                break
+            try:
+                detail_message = build_detail_message(illust, is_novel=False)
+                async for result in send_pixiv_image(
+                    self.pixiv_client,
+                    event,
+                    illust,
+                    detail_message,
+                    show_details=config.show_details,
+                ):
+                    if is_random_push_image_failure_notice(result):
+                        logger.warning(
+                            f"pixiv_search_illust 跳过图片下载失败结果: {getattr(illust, 'id', 'unknown')}"
+                        )
+                        continue
                     await event.send(result)
-                    sent_batches += 1
-                except Exception as e:
-                    logger.warning(f"发送图片失败: {e}")
-
-            if sent_batches > 0:
-                mode = "转发消息" if config.forward_threshold else "普通消息"
-                return (
-                    f"🔥 找到了！为您发送了「{query}」一周内最热门的"
-                    f" {expected_count} 张作品（{mode}）。"
+                    sent_count += 1
+                    break
+            except Exception as e:
+                logger.warning(
+                    f"pixiv_search_illust 发送作品 {getattr(illust, 'id', 'unknown')} 失败: {e}"
                 )
+                continue
 
-            return "找到插画但发送失败，请稍后再试。"
-        except Exception as e:
-            logger.error(f"发送失败: {e}")
-            return "找到插画但发送过程中出现异常。"
+        if sent_count > 0:
+            return f"已发送 {sent_count} 张图片"
+        return "未找到可发送图片"
 
     def _get_event(self, context):
         try:
