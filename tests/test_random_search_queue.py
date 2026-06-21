@@ -90,6 +90,39 @@ class RandomSearchQueueConcurrencyTest(unittest.IsolatedAsyncioTestCase):
                 processor.cancel()
                 await processor
 
+    async def test_queue_item_schedules_next_run_after_executor_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            scheduled = []
+            released = []
+            original_release = random_search.release_random_search_execution
+            random_search.release_random_search_execution = (
+                lambda chat_id, token: released.append((chat_id, token))
+            )
+            service._schedule_next_run_from_now = (
+                lambda chat_id, now, reason: scheduled.append((chat_id, reason))
+                or now
+            )
+
+            async def execute_search_for_group(chat_id):
+                raise RuntimeError("pixiv failed")
+
+            service.execute_search_for_group = execute_search_for_group
+
+            try:
+                await service.task_queue.put(("group-a", "claim-a"))
+                await service.task_queue.get()
+                await service._process_queue_item("group-a", "claim-a")
+            finally:
+                random_search.release_random_search_execution = original_release
+
+            self.assertEqual(len(scheduled), 1)
+            self.assertEqual(scheduled[0][0], "group-a")
+            self.assertEqual(released, [("group-a", "claim-a")])
+
 
 if __name__ == "__main__":
     unittest.main()

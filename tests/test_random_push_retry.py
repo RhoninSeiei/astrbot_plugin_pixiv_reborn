@@ -452,6 +452,61 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sent_count, 0)
             self.assertEqual(service.context.sent_messages, [])
 
+    async def test_successful_illust_is_recorded_before_next_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            sent_records = []
+
+            async def fake_send_random_illust_with_retry(
+                chat_id,
+                session_id,
+                source_type,
+                source_name,
+                illust,
+                config,
+            ):
+                if illust.id == 2:
+                    self.assertEqual(sent_records, [(1, "172448191")])
+                return {illust.id}
+
+            originals = {
+                "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
+                "add_sent_illust": random_search.add_sent_illust,
+                "shuffle": random_search.random.shuffle,
+            }
+            random_search.filter_illusts_with_reason = (
+                lambda illusts, config: (list(illusts), [])
+            )
+            random_search.add_sent_illust = (
+                lambda illust_id, chat_id: sent_records.append((illust_id, chat_id))
+            )
+            random_search.random.shuffle = lambda items: None
+            service._send_random_illust_with_retry = fake_send_random_illust_with_retry
+
+            try:
+                result = await service._send_random_illusts_with_fallback(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="test",
+                    initial_illusts=[FakeIllust(1), FakeIllust(2)],
+                    config=self._make_config(random_search, return_count=2),
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "shuffle" else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertTrue(result.had_sendable_candidates)
+            self.assertEqual(result.sent_count, 2)
+            self.assertEqual(sent_records, [(1, "172448191"), (2, "172448191")])
+
 
 async def _noop_async():
     return None

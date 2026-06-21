@@ -314,7 +314,7 @@ class RandomSearchService:
                 await self.context.send_message(session_id, chain)
 
             for illust_id in attempt_illust_ids:
-                add_random_search_send_attempt(
+                await self._record_random_search_send_attempt(
                     chat_id=chat_id,
                     session_id=session_id,
                     source_type=source_type,
@@ -327,7 +327,7 @@ class RandomSearchService:
         except Exception as e:
             if self._is_send_timeout_after_accept(e):
                 for illust_id in attempt_illust_ids:
-                    add_random_search_send_attempt(
+                    await self._record_random_search_send_attempt(
                         chat_id=chat_id,
                         session_id=session_id,
                         source_type=source_type,
@@ -341,7 +341,7 @@ class RandomSearchService:
                 return set(illust_ids)
 
             for illust_id in attempt_illust_ids:
-                add_random_search_send_attempt(
+                await self._record_random_search_send_attempt(
                     chat_id=chat_id,
                     session_id=session_id,
                     source_type=source_type,
@@ -354,6 +354,9 @@ class RandomSearchService:
             return set()
         finally:
             await cleanup_pixiv_temp_files(message_content)
+
+    async def _record_random_search_send_attempt(self, **kwargs):
+        await asyncio.to_thread(add_random_search_send_attempt, **kwargs)
 
     def _get_illust_id(self, item) -> int | None:
         try:
@@ -455,7 +458,7 @@ class RandomSearchService:
             if attempt < self.RANDOM_IMAGE_SEND_RETRIES:
                 await asyncio.sleep(1)
 
-        add_random_search_send_attempt(
+        await self._record_random_search_send_attempt(
             chat_id=chat_id,
             session_id=session_id,
             source_type=source_type,
@@ -530,6 +533,9 @@ class RandomSearchService:
                 config=config,
             )
             if sent_ids:
+                new_sent_ids = set(sent_ids) - sent_illust_ids
+                for illust_id in new_sent_ids:
+                    await asyncio.to_thread(add_sent_illust, illust_id, chat_id)
                 sent_illust_ids.update(sent_ids)
                 consecutive_failures = 0
                 continue
@@ -547,8 +553,6 @@ class RandomSearchService:
                 )
                 break
 
-        for illust_id in sent_illust_ids:
-            add_sent_illust(illust_id, chat_id)
         if sent_illust_ids:
             logger.info(f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录")
 
@@ -579,8 +583,10 @@ class RandomSearchService:
 
             # 获取所有配置了标签的群组
             # groups = get_all_random_search_groups()
-            tag_groups = get_all_random_search_groups()
-            ranking_groups = get_all_random_ranking_groups()
+            tag_groups, ranking_groups = await asyncio.gather(
+                asyncio.to_thread(get_all_random_search_groups),
+                asyncio.to_thread(get_all_random_ranking_groups),
+            )
             groups = list(set(tag_groups + ranking_groups))
 
             now = datetime.now()
@@ -593,19 +599,24 @@ class RandomSearchService:
                     self.execution_locks[chat_id] = False
 
                 # 从数据库获取下次执行时间
-                next_execution_time = get_schedule_time(chat_id)
+                next_execution_time = await asyncio.to_thread(
+                    get_schedule_time, chat_id
+                )
 
                 # 如果是第一次看到这个群组，立即或稍后调度
                 if next_execution_time is None:
                     # 初始延迟，避免同时启动，使用用户配置的间隔范围
-                    min_interval, max_interval = self._get_group_interval_range(
-                        chat_id
+                    min_interval, max_interval = await asyncio.to_thread(
+                        self._get_group_interval_range, chat_id
                     )
 
                     delay_minutes = random.randint(min_interval, max_interval)
                     next_execution_time = now + timedelta(minutes=delay_minutes)
-                    scheduled_time = self._set_schedule_time(
-                        chat_id, next_execution_time, "首次调度时间"
+                    scheduled_time = await asyncio.to_thread(
+                        self._set_schedule_time,
+                        chat_id,
+                        next_execution_time,
+                        "首次调度时间",
                     )
                     logger.info(
                         f"群组 {chat_id}: 首次调度随机搜索，将在 {scheduled_time} 执行"
@@ -616,21 +627,20 @@ class RandomSearchService:
                 if now >= next_execution_time and not self.execution_locks[chat_id]:
                     next_allowed_time = self._normalize_schedule_time(now)
                     if next_allowed_time != now:
-                        set_schedule_time(chat_id, next_allowed_time)
+                        await asyncio.to_thread(
+                            set_schedule_time, chat_id, next_allowed_time
+                        )
                         logger.info(
                             f"群组 {chat_id}: 当前处于随机搜索静默时段，推迟到 {next_allowed_time}"
                         )
                         continue
-                    claim_token = self._claim_execution(chat_id, now)
+                    claim_token = await asyncio.to_thread(
+                        self._claim_execution, chat_id, now
+                    )
                     if not claim_token:
                         logger.info(f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次入队")
                         continue
-                    scheduled_time = self._schedule_next_run_from_now(
-                        chat_id, now, "防重预占调度时间"
-                    )
-                    logger.info(
-                        f"群组 {chat_id}: 已预占随机搜索执行权，下次候选运行时间为 {scheduled_time}"
-                    )
+                    logger.info(f"群组 {chat_id}: 已领取随机搜索执行权，准备加入队列")
                     pending_tasks.append((chat_id, claim_token))
 
             # 将所有待执行的群组加入队列
@@ -640,7 +650,9 @@ class RandomSearchService:
                     await self.task_queue.put(task_item)
                     logger.info(f"群组 {chat_id}: 已加入随机搜索队列")
                 except Exception as e:
-                    release_random_search_execution(chat_id, claim_token)
+                    await asyncio.to_thread(
+                        release_random_search_execution, chat_id, claim_token
+                    )
                     logger.error(f"将群组 {chat_id} 加入队列失败: {e}")
 
         except Exception as e:
@@ -684,13 +696,17 @@ class RandomSearchService:
             if group_lock.locked() or self.execution_locks.get(chat_id, False):
                 logger.warning(f"群组 {chat_id} 已在执行状态，跳过本次任务")
                 if claim_token:
-                    release_random_search_execution(chat_id, claim_token)
+                    await asyncio.to_thread(
+                        release_random_search_execution, chat_id, claim_token
+                    )
                 self.task_queue.task_done()
                 return
 
             async with group_lock:
                 if claim_token is None:
-                    claim_token = self._claim_execution(chat_id)
+                    claim_token = await asyncio.to_thread(
+                        self._claim_execution, chat_id
+                    )
                     if not claim_token:
                         logger.info(
                             f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次任务"
@@ -705,8 +721,11 @@ class RandomSearchService:
                     await self.execute_search_for_group(chat_id)
 
                     now = datetime.now()
-                    scheduled_time = self._schedule_next_run_from_now(
-                        chat_id, now, "下次调度时间"
+                    scheduled_time = await asyncio.to_thread(
+                        self._schedule_next_run_from_now,
+                        chat_id,
+                        now,
+                        "下次调度时间",
                     )
                     logger.info(
                         f"群组 {chat_id}: 随机搜索已执行。下次运行时间为 {scheduled_time}。"
@@ -714,9 +733,26 @@ class RandomSearchService:
 
                 except Exception as e:
                     logger.error(f"执行群组 {chat_id} 的随机搜索时出错: {e}")
+                    try:
+                        now = datetime.now()
+                        scheduled_time = await asyncio.to_thread(
+                            self._schedule_next_run_from_now,
+                            chat_id,
+                            now,
+                            "异常后的下次调度时间",
+                        )
+                        logger.info(
+                            f"群组 {chat_id}: 随机搜索执行异常。下次运行时间为 {scheduled_time}。"
+                        )
+                    except Exception as schedule_error:
+                        logger.error(
+                            f"为群组 {chat_id} 写入异常后的下次调度时间失败: {schedule_error}"
+                        )
                 finally:
                     self.execution_locks[chat_id] = False
-                    release_random_search_execution(chat_id, claim_token)
+                    await asyncio.to_thread(
+                        release_random_search_execution, chat_id, claim_token
+                    )
                     self.task_queue.task_done()
 
     async def _cleanup_task(self):
@@ -734,8 +770,10 @@ class RandomSearchService:
 
     async def execute_search_for_group(self, chat_id: str) -> int:
         """为特定群组执行随机搜索（标签或排行榜）"""
-        tags = get_random_tags(chat_id)
-        rankings = get_random_rankings(chat_id)
+        tags, rankings = await asyncio.gather(
+            asyncio.to_thread(get_random_tags, chat_id),
+            asyncio.to_thread(get_random_rankings, chat_id),
+        )
 
         if not tags and not rankings:
             return 0
@@ -857,7 +895,9 @@ class RandomSearchService:
         exclude_tags,
         all_illusts,
     ) -> RandomSearchExecutionResult:
-        initial_illusts = filter_sent_illusts(all_illusts, chat_id)
+        initial_illusts = await asyncio.to_thread(
+            filter_sent_illusts, all_illusts, chat_id
+        )
         logger.info(
             "标签 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"
             % (
@@ -1030,7 +1070,9 @@ class RandomSearchService:
 
             # 过滤已发送的作品
             before_sent_filter_count = len(initial_illusts)
-            initial_illusts = filter_sent_illusts(initial_illusts, chat_id)
+            initial_illusts = await asyncio.to_thread(
+                filter_sent_illusts, initial_illusts, chat_id
+            )
             logger.info(
                 "排行榜 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"
                 % (
