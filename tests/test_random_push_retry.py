@@ -114,8 +114,15 @@ class FakeSearchClient:
 
 
 class FakeClientWrapper:
+    def __init__(self):
+        self.calls = []
+
     async def authenticate(self):
         return True
+
+    async def call_pixiv_api(self, func, *args, **kwargs):
+        self.calls.append((getattr(func, "__name__", repr(func)), args, kwargs))
+        return func(*args, **kwargs)
 
 
 def install_import_stubs(data_dir):
@@ -402,6 +409,10 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
                     )
 
             self.assertEqual(client.calls, [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(
+                [call[0] for call in service.client_wrapper.calls],
+                ["search_illust"] * 7,
+            )
             self.assertTrue(result.had_sendable_candidates)
             self.assertEqual(result.sent_count, 1)
             self.assertEqual(len(service.context.sent_messages), 1)

@@ -72,8 +72,15 @@ class FakePixivConfig:
 
 
 class FakeClientWrapper:
+    def __init__(self):
+        self.calls = []
+
     async def authenticate(self):
         return True
+
+    async def call_pixiv_api(self, func, *args, **kwargs):
+        self.calls.append((getattr(func, "__name__", repr(func)), args, kwargs))
+        return func(*args, **kwargs)
 
 
 class FakeUser:
@@ -228,11 +235,12 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         from astrbot.core.agent.run_context import ContextWrapper
 
         client = FakePixivClient()
+        wrapper = FakeClientWrapper()
         event = FakeEvent()
         tool = self.llm_tool.PixivIllustSearchTool(
             pixiv_client=client,
             pixiv_config=FakePixivConfig(),
-            pixiv_client_wrapper=FakeClientWrapper(),
+            pixiv_client_wrapper=wrapper,
         )
 
         async def fake_send_pixiv_image(client, event, illust, detail, show_details):
@@ -254,6 +262,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "已发送 2 张图片")
         self.assertEqual(client.calls[0][0], "Atlanta(艦隊これくしょん)")
+        self.assertEqual([call[0] for call in wrapper.calls], ["search_illust"])
         self.assertEqual([item.illust_id for item in event.sent], [1, 2])
 
 

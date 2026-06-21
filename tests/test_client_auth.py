@@ -60,6 +60,9 @@ class FakeAuthClient:
 class FakeConfig:
     refresh_token = "refresh-token"
     refresh_interval = 1
+    pixiv_api_max_concurrent_requests = 1
+    pixiv_api_retry_count = 2
+    pixiv_api_retry_base_delay = 0.01
 
 
 class PixivClientAuthTest(unittest.IsolatedAsyncioTestCase):
@@ -128,6 +131,72 @@ class PixivClientAuthTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(wrapper.client_api.calls, 1)
+
+    async def test_call_pixiv_api_retries_retryable_errors_with_backoff(self):
+        client_module = import_client_module()
+        wrapper = self.make_wrapper(client_module)
+        attempts = 0
+        sleep_delays = []
+        original_sleep = client_module.asyncio.sleep
+        original_to_thread = client_module.asyncio.to_thread
+
+        def flaky_call():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise client_module.PixivError("429 Too Many Requests")
+            return "ok"
+
+        async def fake_sleep(delay):
+            sleep_delays.append(delay)
+
+        async def fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        client_module.asyncio.sleep = fake_sleep
+        client_module.asyncio.to_thread = fake_to_thread
+        try:
+            result = await wrapper.call_pixiv_api(flaky_call)
+        finally:
+            client_module.asyncio.sleep = original_sleep
+            client_module.asyncio.to_thread = original_to_thread
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep_delays, [0.01, 0.02])
+
+    async def test_call_pixiv_api_limits_concurrent_calls(self):
+        client_module = import_client_module()
+        wrapper = self.make_wrapper(client_module)
+        active = 0
+        max_active = 0
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_to_thread = client_module.asyncio.to_thread
+
+        async def fake_to_thread(func, *args, **kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            entered.set()
+            await release.wait()
+            result = func(*args, **kwargs)
+            active -= 1
+            return result
+
+        client_module.asyncio.to_thread = fake_to_thread
+        try:
+            first = asyncio.create_task(wrapper.call_pixiv_api(lambda: "first"))
+            second = asyncio.create_task(wrapper.call_pixiv_api(lambda: "second"))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.sleep(0)
+            self.assertEqual(max_active, 1)
+            release.set()
+            results = await asyncio.gather(first, second)
+        finally:
+            client_module.asyncio.to_thread = original_to_thread
+
+        self.assertEqual(sorted(results), ["first", "second"])
 
 
 if __name__ == "__main__":

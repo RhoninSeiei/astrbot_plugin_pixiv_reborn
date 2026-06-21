@@ -120,6 +120,13 @@ class PixivConfig:
         self.pil_compress_quality = self.config.get("pil_compress_quality", 100)
         self.pil_compress_target_kb = self.config.get("pil_compress_target_kb", 0)
         self.refresh_interval = self.config.get("refresh_token_interval_minutes", 180)
+        self.pixiv_api_max_concurrent_requests = self.config.get(
+            "pixiv_api_max_concurrent_requests", 2
+        )
+        self.pixiv_api_retry_count = self.config.get("pixiv_api_retry_count", 2)
+        self.pixiv_api_retry_base_delay = self.config.get(
+            "pixiv_api_retry_base_delay", 1.0
+        )
         self.subscription_enabled = self.config.get("subscription_enabled", True)
         self.subscription_force_forward = self.config.get(
             "subscription_force_forward", False
@@ -197,6 +204,9 @@ class PixivConfig:
             f"min_bookmarks={self.min_bookmarks}, min_views={self.min_views}, min_likes={self.min_likes}, "
             f"show_details={self.show_details}, "
             f"refresh_interval={self.refresh_interval} 分钟, "
+            f"pixiv_api_max_concurrent_requests={self.pixiv_api_max_concurrent_requests}, "
+            f"pixiv_api_retry_count={self.pixiv_api_retry_count}, "
+            f"pixiv_api_retry_base_delay={self.pixiv_api_retry_base_delay}, "
             f"subscription_enabled={self.subscription_enabled}, "
             f"subscription_force_forward={self.subscription_force_forward}, "
             f"proxy='{effective_proxy or '未使用'}', "
@@ -274,6 +284,21 @@ class PixivConfigManager:
                 "max": 10080,
                 "hidden": True,
             },
+            "pixiv_api_max_concurrent_requests": {
+                "type": "int",
+                "min": 1,
+                "max": 8,
+            },
+            "pixiv_api_retry_count": {
+                "type": "int",
+                "min": 0,
+                "max": 5,
+            },
+            "pixiv_api_retry_base_delay": {
+                "type": "float",
+                "min": 0.0,
+                "max": 60.0,
+            },
             "subscription_check_interval_minutes": {
                 "type": "int",
                 "min": 5,
@@ -333,6 +358,9 @@ class PixivConfigManager:
             "image_send_method",
             "pil_compress_quality",
             "pil_compress_target_kb",
+            "pixiv_api_max_concurrent_requests",
+            "pixiv_api_retry_count",
+            "pixiv_api_retry_base_delay",
             "subscription_enabled",
             "subscription_force_forward",
             "fanbox_data_source",
@@ -408,6 +436,20 @@ class PixivConfigManager:
                         setattr(self.config, key, v)
                 except ValueError:
                     return False, f"配置项 {key} 的值 '{value}' 不是有效的整数。"
+            elif typ == "float":
+                try:
+                    v = float(value)
+                    minv, maxv = (
+                        schema_item.get("min", None),
+                        schema_item.get("max", None),
+                    )
+                    if (minv is not None and v < minv) or (
+                        maxv is not None and v > maxv
+                    ):
+                        return False, f"配置项 {key} 的值必须在 {minv} 到 {maxv} 之间。"
+                    setattr(self.config, key, v)
+                except ValueError:
+                    return False, f"配置项 {key} 的值 '{value}' 不是有效的数字。"
             elif typ == "string":
                 if key in {"random_search_quiet_start", "random_search_quiet_end"}:
                     try:
@@ -457,6 +499,9 @@ class PixivConfigManager:
         elif schema_item["type"] == "bool":
             msg += "可选值: true, false"
         elif schema_item["type"] == "int":
+            minv, maxv = schema_item.get("min", None), schema_item.get("max", None)
+            msg += f"可选范围: {minv} ~ {maxv}"
+        elif schema_item["type"] == "float":
             minv, maxv = schema_item.get("min", None), schema_item.get("max", None)
             msg += f"可选范围: {minv} ~ {maxv}"
         elif schema_item["type"] == "string":

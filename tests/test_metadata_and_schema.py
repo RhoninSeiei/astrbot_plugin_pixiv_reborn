@@ -94,6 +94,18 @@ class MetadataAndSchemaTest(unittest.TestCase):
             command_schema["random_search_max_concurrent_jobs"]["max"],
             webui_schema["random_search_max_concurrent_jobs"]["max"],
         )
+        self.assertEqual(
+            command_schema["pixiv_api_max_concurrent_requests"]["max"],
+            webui_schema["pixiv_api_max_concurrent_requests"]["max"],
+        )
+        self.assertEqual(
+            command_schema["pixiv_api_retry_count"]["max"],
+            webui_schema["pixiv_api_retry_count"]["max"],
+        )
+        self.assertEqual(
+            command_schema["pixiv_api_retry_base_delay"]["max"],
+            webui_schema["pixiv_api_retry_base_delay"]["max"],
+        )
 
 
 if __name__ == "__main__":

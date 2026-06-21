@@ -856,7 +856,7 @@ class RandomSearchService:
             if page_limit > 0 and page_count >= page_limit:
                 break
 
-            json_result = await asyncio.to_thread(
+            json_result = await self.client_wrapper.call_pixiv_api(
                 self.client.search_illust, **next_params
             )
 
@@ -1047,7 +1047,7 @@ class RandomSearchService:
             return RandomSearchExecutionResult(completed=False)
 
         try:
-            ranking_result = await asyncio.to_thread(
+            ranking_result = await self.client_wrapper.call_pixiv_api(
                 self.client.illust_ranking, mode=mode, date=date
             )
             initial_illusts = ranking_result.illusts if ranking_result.illusts else []

@@ -16,6 +16,8 @@ class PixivClientWrapper:
         self._last_auth_failure_at: float | None = None
         self._auth_ttl_seconds = 30 * 60
         self._auth_failure_cooldown_seconds = 30
+        self._api_call_semaphore: asyncio.Semaphore | None = None
+        self._api_call_max_concurrent_requests: int | None = None
 
         # 根据是否配置代理选择不同的 API 客户端
         if pixiv_config.proxy:
@@ -117,6 +119,71 @@ class PixivClientWrapper:
             self._auth_ttl_seconds = 30 * 60
         if not hasattr(self, "_auth_failure_cooldown_seconds"):
             self._auth_failure_cooldown_seconds = 30
+
+    def _coerce_int_config(
+        self, name: str, default: int, minimum: int, maximum: int
+    ) -> int:
+        value = getattr(self.pixiv_config, name, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return min(max(parsed, minimum), maximum)
+
+    def _coerce_float_config(
+        self, name: str, default: float, minimum: float, maximum: float
+    ) -> float:
+        value = getattr(self.pixiv_config, name, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return min(max(parsed, minimum), maximum)
+
+    def _ensure_api_call_state(self):
+        max_concurrent = self._coerce_int_config(
+            "pixiv_api_max_concurrent_requests", 2, 1, 8
+        )
+        if (
+            not hasattr(self, "_api_call_semaphore")
+            or self._api_call_semaphore is None
+            or getattr(self, "_api_call_max_concurrent_requests", None)
+            != max_concurrent
+        ):
+            self._api_call_semaphore = asyncio.Semaphore(max_concurrent)
+            self._api_call_max_concurrent_requests = max_concurrent
+
+    def _is_retryable_api_error(self, error: Exception) -> bool:
+        for attr in ("status_code", "status", "code"):
+            value = getattr(error, attr, None)
+            if value is None:
+                continue
+            try:
+                if int(value) in {429, 500, 502, 503, 504}:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+        text = f"{type(error).__name__} {error}".lower()
+        retryable_markers = (
+            "429",
+            "too many",
+            "rate limit",
+            "timeout",
+            "temporar",
+            "connection",
+            "reset",
+            "unavailable",
+            "bad gateway",
+            "gateway timeout",
+        )
+        if isinstance(error, (PixivError, TimeoutError, ConnectionError)):
+            return any(marker in text for marker in retryable_markers)
+        return any(marker in text for marker in retryable_markers)
 
     def _auth_cache_valid(self, now: float) -> bool:
         if self._last_auth_success_at is None:
@@ -255,4 +322,26 @@ class PixivClientWrapper:
 
     async def call_pixiv_api(self, func, *args, **kwargs):
         """异步调用 Pixiv API 的辅助方法"""
-        return await asyncio.to_thread(func, *args, **kwargs)
+        self._ensure_api_call_state()
+        retry_count = self._coerce_int_config("pixiv_api_retry_count", 2, 0, 5)
+        base_delay = self._coerce_float_config(
+            "pixiv_api_retry_base_delay", 1.0, 0.0, 60.0
+        )
+
+        async with self._api_call_semaphore:
+            attempt = 0
+            while True:
+                try:
+                    return await asyncio.to_thread(func, *args, **kwargs)
+                except Exception as e:
+                    if attempt >= retry_count or not self._is_retryable_api_error(e):
+                        raise
+
+                    delay = base_delay * (2**attempt)
+                    attempt += 1
+                    logger.warning(
+                        f"Pixiv API 调用失败，将在 {delay:.2f} 秒后重试 "
+                        f"{attempt}/{retry_count}: {e}"
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)

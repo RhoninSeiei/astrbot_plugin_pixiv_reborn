@@ -1,4 +1,5 @@
 from typing import Any, List
+import asyncio
 import hashlib
 import io
 import base64
@@ -24,6 +25,12 @@ from .pixiv_utils import (
     generate_safe_filename,
 )
 from .random_empty_retry import is_random_push_image_failure_notice
+
+
+async def _call_pixiv_api(pixiv_client_wrapper, func, *args, **kwargs):
+    if pixiv_client_wrapper and hasattr(pixiv_client_wrapper, "call_pixiv_api"):
+        return await pixiv_client_wrapper.call_pixiv_api(func, *args, **kwargs)
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def bind_tools_to_plugin_module(tools, module_path: str) -> None:
@@ -321,7 +328,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             while page_count < pages_to_fetch:
                 try:
                     if page_count == 0:
-                        search_result = await asyncio.to_thread(
+                        search_result = await _call_pixiv_api(
+                            self.pixiv_client_wrapper,
                             self.pixiv_client.search_illust,
                             search_word,
                             search_target=search_target,
@@ -332,7 +340,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                     else:
                         if not next_params:
                             break
-                        search_result = await asyncio.to_thread(
+                        search_result = await _call_pixiv_api(
+                            self.pixiv_client_wrapper,
                             self.pixiv_client.search_illust, **next_params
                         )
 
@@ -524,7 +533,8 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
         if query.isdigit():
             logger.info(f"检测到小说ID {query}")
             try:
-                novel_detail = await asyncio.to_thread(
+                novel_detail = await _call_pixiv_api(
+                    self.pixiv_client_wrapper,
                     self.pixiv_client.novel_detail, int(query)
                 )
                 if novel_detail and novel_detail.novel:
@@ -542,7 +552,8 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
 
         # 标签搜索
         try:
-            search_result = await asyncio.to_thread(
+            search_result = await _call_pixiv_api(
+                self.pixiv_client_wrapper,
                 self.pixiv_client.search_novel,
                 tags,
                 search_target="partial_match_for_tags",
@@ -574,7 +585,8 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
         logger.info(f"准备下载小说 {novel_title} (ID: {novel_id})")
 
         try:
-            novel_content_result = await asyncio.to_thread(
+            novel_content_result = await _call_pixiv_api(
+                self.pixiv_client_wrapper,
                 self.pixiv_client.webview_novel, novel_id
             )
             if not novel_content_result or not hasattr(novel_content_result, "text"):

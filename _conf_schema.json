@@ -7,6 +7,30 @@
       "is_sensitive": true,
       "required": true
   },
+  "pixiv_api_max_concurrent_requests": {
+      "description": "Pixiv API 最大并发请求数",
+      "type": "int",
+      "hint": "限制通过 PixivClientWrapper.call_pixiv_api 发出的并发 API 调用数。",
+      "default": 2,
+      "min": 1,
+      "max": 8
+  },
+  "pixiv_api_retry_count": {
+      "description": "Pixiv API 可重试错误重试次数",
+      "type": "int",
+      "hint": "遇到 429、临时网络错误或 5xx 时的最大重试次数。",
+      "default": 2,
+      "min": 0,
+      "max": 5
+  },
+  "pixiv_api_retry_base_delay": {
+      "description": "Pixiv API 重试基础延迟秒数",
+      "type": "float",
+      "hint": "指数退避的基础延迟，实际等待时间为 base * 2^attempt。",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 60.0
+  },
   "fanbox_sessid": {
       "description": "Pixiv Fanbox Session（FANBOXSESSID）",
       "type": "string",
