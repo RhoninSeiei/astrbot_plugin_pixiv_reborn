@@ -842,6 +842,7 @@ class RandomSearchService:
 
     async def _fetch_tag_illusts(
         self,
+        chat_id: str,
         raw_tag: str,
         search_params: dict,
         page_limit: int,
@@ -865,10 +866,14 @@ class RandomSearchService:
 
             current_illusts = json_result.illusts
             if current_illusts:
-                all_illusts.extend(current_illusts)
+                unsent_illusts = await asyncio.to_thread(
+                    filter_sent_illusts, current_illusts, chat_id
+                )
+                all_illusts.extend(unsent_illusts)
                 page_count += 1
                 logger.info(
-                    f"标签 {raw_tag} 的随机搜索：已获取第 {page_count} 页，找到 {len(current_illusts)} 个插画"
+                    f"标签 {raw_tag} 的随机搜索：已获取第 {page_count} 页，"
+                    f"找到 {len(current_illusts)} 个插画，发送缓存过滤后保留 {len(unsent_illusts)} 个候选"
                 )
 
                 if page_count % 3 == 0:
@@ -895,17 +900,10 @@ class RandomSearchService:
         exclude_tags,
         all_illusts,
     ) -> RandomSearchExecutionResult:
-        initial_illusts = await asyncio.to_thread(
-            filter_sent_illusts, all_illusts, chat_id
-        )
+        initial_illusts = list(all_illusts)
         logger.info(
-            "标签 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"
-            % (
-                raw_tag,
-                len(all_illusts),
-                len(all_illusts) - len(initial_illusts),
-                len(initial_illusts),
-            )
+            "标签 %s 的随机搜索发送缓存过滤统计: 累计未发送候选 %s 个，开始条件过滤。"
+            % (raw_tag, len(initial_illusts))
         )
 
         if not initial_illusts:
@@ -967,10 +965,10 @@ class RandomSearchService:
 
             deep_search_depth = self.pixiv_config.deep_search_depth
             all_illusts, page_count, next_params = await self._fetch_tag_illusts(
-                raw_tag, search_params, deep_search_depth
+                chat_id, raw_tag, search_params, deep_search_depth
             )
 
-            if not all_illusts:
+            if not all_illusts and page_count == 0:
                 logger.info(f"标签 {raw_tag} 的随机搜索未返回结果。")
                 return RandomSearchExecutionResult(had_sendable_candidates=False)
 
@@ -1002,6 +1000,7 @@ class RandomSearchService:
                     f"标签 {raw_tag} 在前 {page_count} 页无可发送作品，扩大搜索范围到 {retry_depth} 页"
                 )
                 all_illusts, page_count, next_params = await self._fetch_tag_illusts(
+                    chat_id,
                     raw_tag,
                     search_params,
                     retry_depth,

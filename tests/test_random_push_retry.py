@@ -351,11 +351,13 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
 
             client = FakeSearchClient(final_page_with_candidates=7)
             sent_records = []
+            filter_call_sizes = []
 
             async def fake_send_pixiv_image(client, event, illust, detail, show_details):
                 yield event.plain_result(f"标题: {illust.title}")
 
             def fake_filter_sent_illusts(illusts, chat_id):
+                filter_call_sizes.append(len(illusts))
                 return [illust for illust in illusts if illust.id >= 7000]
 
             originals = {
@@ -413,6 +415,7 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
                 [call[0] for call in service.client_wrapper.calls],
                 ["search_illust"] * 7,
             )
+            self.assertEqual(filter_call_sizes, [30] * 7)
             self.assertTrue(result.had_sendable_candidates)
             self.assertEqual(result.sent_count, 1)
             self.assertEqual(len(service.context.sent_messages), 1)
