@@ -70,6 +70,8 @@ class RandomSearchSendAttemptTest(unittest.TestCase):
             self.assertEqual(rows[0].illust_id, 123)
             self.assertFalse(rows[1].success)
             self.assertEqual(rows[1].error_message, "rich media transfer failed")
+            if not database.db.is_closed():
+                database.db.close()
 
 
 if __name__ == "__main__":

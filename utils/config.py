@@ -151,6 +151,9 @@ class PixivConfig:
         self.random_search_empty_retry_sources = self.config.get(
             "random_search_empty_retry_sources", 1
         )
+        self.random_search_max_concurrent_jobs = self.config.get(
+            "random_search_max_concurrent_jobs", 2
+        )
         self.random_sent_illust_retention_days = self.config.get(
             "random_sent_illust_retention_days", 7
         )
@@ -202,6 +205,7 @@ class PixivConfig:
             f"random_search_empty_retry_enabled={self.random_search_empty_retry_enabled}, "
             f"random_search_empty_retry_extra_depth={self.random_search_empty_retry_extra_depth}, "
             f"random_search_empty_retry_sources={self.random_search_empty_retry_sources}, "
+            f"random_search_max_concurrent_jobs={self.random_search_max_concurrent_jobs}, "
             f"fanbox_sessid={'已设置' if self.fanbox_sessid else '未设置'}, "
             f"fanbox_cookie={'已设置' if self.fanbox_cookie else '未设置'}, "
             f"fanbox_user_agent={'已设置' if self.fanbox_user_agent else '未设置'}, "
@@ -240,7 +244,7 @@ class PixivConfigManager:
             "min_bookmarks": {"type": "int", "min": 0, "max": 100000000},
             "min_views": {"type": "int", "min": 0, "max": 100000000},
             "min_likes": {"type": "int", "min": 0, "max": 100000000},
-            "return_count": {"type": "int", "min": 1, "max": 30},
+            "return_count": {"type": "int", "min": 1, "max": 10},
             "show_filter_result": {"type": "bool"},
             "single_response_mode": {"type": "bool"},
             "show_details": {"type": "bool"},
@@ -288,6 +292,11 @@ class PixivConfigManager:
                 "max": 30,
             },
             "random_search_empty_retry_sources": {"type": "int", "min": 0, "max": 10},
+            "random_search_max_concurrent_jobs": {
+                "type": "int",
+                "min": 1,
+                "max": 8,
+            },
             "proxy": {"type": "string", "hidden": True},
             "fanbox_sessid": {"type": "string", "hidden": True},
             "fanbox_cookie": {"type": "string", "hidden": True},
@@ -336,6 +345,7 @@ class PixivConfigManager:
             "random_search_empty_retry_enabled",
             "random_search_empty_retry_extra_depth",
             "random_search_empty_retry_sources",
+            "random_search_max_concurrent_jobs",
             "random_sent_illust_retention_days",
         ]
 

@@ -290,6 +290,14 @@
       "min": 0,
       "max": 10
   },
+  "random_search_max_concurrent_jobs": {
+      "description": "随机搜索跨群最大并发任务数",
+      "type": "int",
+      "hint": "同一群聊仍保持单任务执行；不同群聊最多同时执行的随机搜索任务数。",
+      "default": 2,
+      "min": 1,
+      "max": 8
+  },
   "random_sent_illust_retention_days": {
       "description": "随机搜索已发送作品保留天数,以避免重复发送",
       "type": "int",

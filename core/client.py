@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import time
 from astrbot.api import logger
 from pixivpy3 import ByPassSniApi, PixivError, AppPixivAPI
 
@@ -10,6 +11,11 @@ class PixivClientWrapper:
     def __init__(self, pixiv_config):
         self.pixiv_config = pixiv_config
         self._refresh_task: asyncio.Task | None = None
+        self._auth_lock = asyncio.Lock()
+        self._last_auth_success_at: float | None = None
+        self._last_auth_failure_at: float | None = None
+        self._auth_ttl_seconds = 30 * 60
+        self._auth_failure_cooldown_seconds = 30
 
         # 根据是否配置代理选择不同的 API 客户端
         if pixiv_config.proxy:
@@ -99,28 +105,74 @@ class PixivClientWrapper:
 
         return False
 
+    def _ensure_auth_state(self):
+        """兼容测试或热重载期间绕过 __init__ 的包装器实例。"""
+        if not hasattr(self, "_auth_lock"):
+            self._auth_lock = asyncio.Lock()
+        if not hasattr(self, "_last_auth_success_at"):
+            self._last_auth_success_at = None
+        if not hasattr(self, "_last_auth_failure_at"):
+            self._last_auth_failure_at = None
+        if not hasattr(self, "_auth_ttl_seconds"):
+            self._auth_ttl_seconds = 30 * 60
+        if not hasattr(self, "_auth_failure_cooldown_seconds"):
+            self._auth_failure_cooldown_seconds = 30
+
+    def _auth_cache_valid(self, now: float) -> bool:
+        if self._last_auth_success_at is None:
+            return False
+        return now - self._last_auth_success_at < self._auth_ttl_seconds
+
+    def _auth_failure_in_cooldown(self, now: float) -> bool:
+        if self._last_auth_failure_at is None:
+            return False
+        return now - self._last_auth_failure_at < self._auth_failure_cooldown_seconds
+
+    def _mark_auth_success(self):
+        self._last_auth_success_at = time.monotonic()
+        self._last_auth_failure_at = None
+
+    def _mark_auth_failure(self):
+        self._last_auth_failure_at = time.monotonic()
+
     async def authenticate(self) -> bool:
         """尝试使用配置的凭据进行 Pixiv API 认证"""
-        # 每次调用都尝试认证，让 pixivpy3 处理 token 状态
-        try:
-            if self.pixiv_config.refresh_token:
-                # 调用 auth()，pixivpy3 会在需要时刷新 token
+        self._ensure_auth_state()
+        if not self.pixiv_config.refresh_token:
+            logger.error("Pixiv 插件：未提供有效的 Refresh Token，无法进行认证。")
+            return False
+
+        now = time.monotonic()
+        if self._auth_cache_valid(now):
+            return True
+        if self._auth_failure_in_cooldown(now):
+            logger.warning("Pixiv 插件：认证失败冷却中，暂缓重复认证。")
+            return False
+
+        async with self._auth_lock:
+            now = time.monotonic()
+            if self._auth_cache_valid(now):
+                return True
+            if self._auth_failure_in_cooldown(now):
+                logger.warning("Pixiv 插件：认证失败冷却中，暂缓重复认证。")
+                return False
+
+            try:
                 await asyncio.to_thread(
                     self.client_api.auth, refresh_token=self.pixiv_config.refresh_token
                 )
+                self._mark_auth_success()
                 return True
-            else:
-                logger.error("Pixiv 插件：未提供有效的 Refresh Token，无法进行认证。")
+            except Exception as e:
+                self._mark_auth_failure()
+                logger.error(
+                    f"Pixiv 插件：认证/刷新时发生错误 - 异常类型: {type(e)}, 错误信息: {e}"
+                )
                 return False
-
-        except Exception as e:
-            logger.error(
-                f"Pixiv 插件：认证/刷新时发生错误 - 异常类型: {type(e)}, 错误信息: {e}"
-            )
-            return False
 
     async def periodic_token_refresh(self):
         """定期尝试使用 refresh_token 进行认证以保持其活性"""
+        self._ensure_auth_state()
         while True:
             try:
                 # 先等待指定间隔
@@ -140,14 +192,21 @@ class PixivClientWrapper:
 
                 logger.info("Pixiv Token 刷新任务：尝试使用 Refresh Token 进行认证...")
                 try:
-                    self.client_api.auth(refresh_token=current_refresh_token)
+                    async with self._auth_lock:
+                        await asyncio.to_thread(
+                            self.client_api.auth,
+                            refresh_token=current_refresh_token,
+                        )
+                        self._mark_auth_success()
                     logger.info("Pixiv Token 刷新任务：认证调用成功。")
 
                 except PixivError as pe:
+                    self._mark_auth_failure()
                     logger.error(
                         f"Pixiv Token 刷新任务：认证时发生 Pixiv API 错误 - {pe}"
                     )
                 except Exception as e:
+                    self._mark_auth_failure()
                     logger.error(
                         f"Pixiv Token 刷新任务：认证时发生未知错误 - {type(e).__name__}: {e}"
                     )

@@ -58,54 +58,60 @@ class RandomSearchClaimTest(unittest.TestCase):
     def test_active_claim_blocks_duplicate_until_release_or_expiry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = import_database_for_temp_dir(temp_dir)
+            try:
+                database.initialize_database()
 
-            database.initialize_database()
-
-            now = datetime(2026, 5, 20, 12, 0, 0)
-            first_claim = database.try_claim_random_search_execution(
-                "905956314",
-                now,
-                now + timedelta(minutes=15),
-            )
-            duplicate_claim = database.try_claim_random_search_execution(
-                "905956314",
-                now + timedelta(minutes=1),
-                now + timedelta(minutes=16),
-            )
-
-            self.assertTrue(first_claim)
-            self.assertFalse(duplicate_claim)
-
-            database.release_random_search_execution("905956314")
-            self.assertTrue(
-                database.try_claim_random_search_execution(
+                now = datetime(2026, 5, 20, 12, 0, 0)
+                first_claim = database.try_claim_random_search_execution(
                     "905956314",
-                    now + timedelta(minutes=2),
-                    now + timedelta(minutes=17),
+                    now,
+                    now + timedelta(minutes=15),
                 )
-            )
+                duplicate_claim = database.try_claim_random_search_execution(
+                    "905956314",
+                    now + timedelta(minutes=1),
+                    now + timedelta(minutes=16),
+                )
+
+                self.assertTrue(first_claim)
+                self.assertFalse(duplicate_claim)
+
+                database.release_random_search_execution("905956314")
+                self.assertTrue(
+                    database.try_claim_random_search_execution(
+                        "905956314",
+                        now + timedelta(minutes=2),
+                        now + timedelta(minutes=17),
+                    )
+                )
+            finally:
+                if not database.db.is_closed():
+                    database.db.close()
 
     def test_expired_claim_can_be_replaced(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database = import_database_for_temp_dir(temp_dir)
+            try:
+                database.initialize_database()
 
-            database.initialize_database()
-
-            now = datetime(2026, 5, 20, 12, 0, 0)
-            self.assertTrue(
-                database.try_claim_random_search_execution(
-                    "947135267",
-                    now,
-                    now + timedelta(minutes=5),
+                now = datetime(2026, 5, 20, 12, 0, 0)
+                self.assertTrue(
+                    database.try_claim_random_search_execution(
+                        "947135267",
+                        now,
+                        now + timedelta(minutes=5),
+                    )
                 )
-            )
-            self.assertTrue(
-                database.try_claim_random_search_execution(
-                    "947135267",
-                    now + timedelta(minutes=6),
-                    now + timedelta(minutes=21),
+                self.assertTrue(
+                    database.try_claim_random_search_execution(
+                        "947135267",
+                        now + timedelta(minutes=6),
+                        now + timedelta(minutes=21),
+                    )
                 )
-            )
+            finally:
+                if not database.db.is_closed():
+                    database.db.close()
 
 
 if __name__ == "__main__":

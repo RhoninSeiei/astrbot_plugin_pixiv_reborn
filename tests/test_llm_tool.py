@@ -197,6 +197,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         pixiv_tool = next(tool for tool in tools if tool.name == "pixiv_search_illust")
         manager = FunctionToolManager()
         manager.func_list.extend(tools)
+        self.llm_tool.ensure_identity_preserving_tool_manager(manager)
         request_tool_set = manager.get_full_tool_set()
         event = object.__new__(AstrMessageEvent)
         req = event.request_llm(
@@ -207,6 +208,21 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(manager.get_func("pixiv_search_illust"), pixiv_tool)
         self.assertIs(request_tool_set.get_tool("pixiv_search_illust"), pixiv_tool)
         self.assertIs(req.func_tool.get_tool("pixiv_search_illust"), pixiv_tool)
+
+    def test_registered_tools_are_bound_to_plugin_main_module(self):
+        tools = self.llm_tool.create_pixiv_llm_tools(
+            pixiv_client=FakePixivClient(),
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+        module_path = "data.plugins.astrbot_plugin_pixiv_reborn.main"
+
+        self.llm_tool.bind_tools_to_plugin_module(tools, module_path)
+
+        for tool in tools:
+            self.assertEqual(tool.__module__, module_path)
+            self.assertEqual(tool.handler_module_path, module_path)
+            self.assertEqual(tool.handler.__module__, module_path)
 
     async def test_call_uses_candidate_tags_and_sends_images_in_event_context(self):
         from astrbot.core.agent.run_context import ContextWrapper

@@ -1,6 +1,9 @@
 __pycache__/
 .serena/
 .tmp/
+.venv/
+.pip-cache/
+.test-deps/
 data/t2i_templates/
 data/cmd_config.json
 .ace-tool/

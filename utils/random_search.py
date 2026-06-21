@@ -62,13 +62,25 @@ class RandomSearchService:
         self.scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         self.job = None
         # 使用数据库存储调度时间，不再使用内存字典
-        # 防止并发执行的锁: {chat_id: bool}
+        # 防止同一群聊并发执行的状态: {chat_id: bool}
         self.execution_locks = {}
+        self.group_locks = {}
 
-        self.global_execution_lock = asyncio.Lock()  # 全局执行锁
+        max_concurrent_jobs = getattr(
+            self.pixiv_config, "random_search_max_concurrent_jobs", 2
+        )
+        try:
+            max_concurrent_jobs = int(max_concurrent_jobs)
+        except (TypeError, ValueError):
+            max_concurrent_jobs = 2
+        self.max_concurrent_random_jobs = min(max(max_concurrent_jobs, 1), 8)
+        self.global_execution_semaphore = asyncio.Semaphore(
+            self.max_concurrent_random_jobs
+        )
         self.task_queue = asyncio.Queue()  # 任务队列
         self.is_queue_processor_running = False  # 队列处理器运行状态
         self._queue_processor_task: asyncio.Task | None = None
+        self._active_queue_tasks: set[asyncio.Task] = set()
         self._is_running = False
 
     def start(self):
@@ -119,6 +131,12 @@ class RandomSearchService:
             except Exception as e:
                 logger.error(f"等待随机搜索队列处理器停止时出错: {e}")
         self._queue_processor_task = None
+        active_tasks = list(self._active_queue_tasks)
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        self._active_queue_tasks.clear()
         self.is_queue_processor_running = False
 
     def _normalize_schedule_time(self, candidate: datetime) -> datetime:
@@ -148,6 +166,13 @@ class RandomSearchService:
     def _get_group_interval_range(self, chat_id: str):
         group_config = self._resolve_group_runtime_config(chat_id)
         return group_config.min_interval_minutes, group_config.max_interval_minutes
+
+    def _get_group_lock(self, chat_id: str) -> asyncio.Lock:
+        lock = self.group_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.group_locks[chat_id] = lock
+        return lock
 
     def _empty_retry_enabled(self) -> bool:
         return bool(
@@ -623,13 +648,12 @@ class RandomSearchService:
 
     async def _task_queue_processor(self):
         """
-        任务队列处理器，按顺序执行队列中的搜索任务。
+        任务队列处理器，按全局并发上限派发队列中的搜索任务。
         """
         logger.info("RandomSearchService 任务队列处理器开始运行")
         try:
             while self._is_running:
                 try:
-                    # 从队列中获取群组ID（阻塞等待）
                     task_item = await self.task_queue.get()
                     if isinstance(task_item, tuple):
                         chat_id, claim_token = task_item
@@ -637,48 +661,11 @@ class RandomSearchService:
                         chat_id = task_item
                         claim_token = None
 
-                    # 使用全局锁确保同时只有一个任务执行
-                    async with self.global_execution_lock:
-                        # 再次检查群组是否仍在执行状态
-                        if self.execution_locks.get(chat_id, False):
-                            logger.warning(f"群组 {chat_id} 已在执行状态，跳过本次任务")
-                            if claim_token:
-                                release_random_search_execution(chat_id, claim_token)
-                            self.task_queue.task_done()
-                            continue
-
-                        if claim_token is None:
-                            claim_token = self._claim_execution(chat_id)
-                            if not claim_token:
-                                logger.info(
-                                    f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次任务"
-                                )
-                                self.task_queue.task_done()
-                                continue
-
-                        # 设置执行锁
-                        self.execution_locks[chat_id] = True
-
-                        try:
-                            logger.info(f"开始执行群组 {chat_id} 的随机搜索")
-                            await self.execute_search_for_group(chat_id)
-
-                            # 调度下次运行
-                            now = datetime.now()
-                            scheduled_time = self._schedule_next_run_from_now(
-                                chat_id, now, "下次调度时间"
-                            )
-                            logger.info(
-                                f"群组 {chat_id}: 随机搜索已执行。下次运行时间为 {scheduled_time}。"
-                            )
-
-                        except Exception as e:
-                            logger.error(f"执行群组 {chat_id} 的随机搜索时出错: {e}")
-                        finally:
-                            # 释放执行锁
-                            self.execution_locks[chat_id] = False
-                            release_random_search_execution(chat_id, claim_token)
-                            self.task_queue.task_done()
+                    task = asyncio.create_task(
+                        self._process_queue_item(chat_id, claim_token)
+                    )
+                    self._active_queue_tasks.add(task)
+                    task.add_done_callback(self._active_queue_tasks.discard)
 
                 except asyncio.CancelledError:
                     logger.info("RandomSearchService 任务队列处理器被取消")
@@ -690,6 +677,47 @@ class RandomSearchService:
         finally:
             self.is_queue_processor_running = False
             self._queue_processor_task = None
+
+    async def _process_queue_item(self, chat_id: str, claim_token: str | None):
+        async with self.global_execution_semaphore:
+            group_lock = self._get_group_lock(chat_id)
+            if group_lock.locked() or self.execution_locks.get(chat_id, False):
+                logger.warning(f"群组 {chat_id} 已在执行状态，跳过本次任务")
+                if claim_token:
+                    release_random_search_execution(chat_id, claim_token)
+                self.task_queue.task_done()
+                return
+
+            async with group_lock:
+                if claim_token is None:
+                    claim_token = self._claim_execution(chat_id)
+                    if not claim_token:
+                        logger.info(
+                            f"群组 {chat_id}: 已有随机搜索执行领取，跳过本次任务"
+                        )
+                        self.task_queue.task_done()
+                        return
+
+                self.execution_locks[chat_id] = True
+
+                try:
+                    logger.info(f"开始执行群组 {chat_id} 的随机搜索")
+                    await self.execute_search_for_group(chat_id)
+
+                    now = datetime.now()
+                    scheduled_time = self._schedule_next_run_from_now(
+                        chat_id, now, "下次调度时间"
+                    )
+                    logger.info(
+                        f"群组 {chat_id}: 随机搜索已执行。下次运行时间为 {scheduled_time}。"
+                    )
+
+                except Exception as e:
+                    logger.error(f"执行群组 {chat_id} 的随机搜索时出错: {e}")
+                finally:
+                    self.execution_locks[chat_id] = False
+                    release_random_search_execution(chat_id, claim_token)
+                    self.task_queue.task_done()
 
     async def _cleanup_task(self):
         """定期清理过期记录的任务"""
@@ -1069,6 +1097,8 @@ class RandomSearchService:
         return {
             "queue_size": self.task_queue.qsize(),
             "is_queue_processor_running": self.is_queue_processor_running,
+            "max_concurrent_random_jobs": self.max_concurrent_random_jobs,
+            "active_queue_tasks": len(self._active_queue_tasks),
             "execution_locks": dict(self.execution_locks),
             "active_groups": [
                 chat_id for chat_id, locked in self.execution_locks.items() if locked
@@ -1080,7 +1110,7 @@ class RandomSearchService:
         if chat_id not in self.execution_locks:
             self.execution_locks[chat_id] = False
 
-        if self.execution_locks[chat_id]:
+        if self.execution_locks[chat_id] or self._get_group_lock(chat_id).locked():
             logger.warning(f"群组 {chat_id} 已在执行状态，无法强制执行")
             return False
 

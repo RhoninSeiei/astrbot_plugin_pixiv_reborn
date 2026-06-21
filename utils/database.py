@@ -9,7 +9,14 @@ data_dir.mkdir(parents=True, exist_ok=True)
 
 # 数据库文件路径
 db_path = data_dir / "subscriptions.db"
-db = pw.SqliteDatabase(str(db_path))
+db = pw.SqliteDatabase(
+    str(db_path),
+    pragmas={
+        "journal_mode": "wal",
+        "cache_size": -64000,
+        "foreign_keys": 1,
+    },
+)
 
 
 class BaseModel(pw.Model):
@@ -192,6 +199,7 @@ def initialize_database():
         if not SentIllust.table_exists():
             db.create_tables([SentIllust])
             logger.info("数据库初始化成功，数据表 sent_illust 已创建。")
+        _ensure_database_indexes()
 
         if not RandomSearchSchedule.table_exists():
             db.create_tables([RandomSearchSchedule])
@@ -236,6 +244,21 @@ def initialize_database():
     finally:
         if not db.is_closed():
             db.close()
+
+
+def _ensure_database_indexes():
+    """补齐旧库不会自动获得的性能索引。"""
+    try:
+        db.execute_sql(
+            "CREATE INDEX IF NOT EXISTS idx_sentillust_chat_illust "
+            "ON sentillust (chat_id, illust_id)"
+        )
+        db.execute_sql(
+            "CREATE INDEX IF NOT EXISTS idx_sentillust_chat_sent_at "
+            "ON sentillust (chat_id, sent_at)"
+        )
+    except Exception as e:
+        logger.error(f"创建数据库索引失败: {e}")
 
 
 def add_subscription(
@@ -392,23 +415,12 @@ def get_random_tags(chat_id: str) -> list:
 def get_all_random_search_groups() -> list:
     """获取所有启用了随机搜索的群聊ID"""
     try:
-        # 获取所有有随机搜索标签的群组
-        all_groups_query = RandomSearchTag.select(RandomSearchTag.chat_id).distinct()
-        all_groups = [row.chat_id for row in all_groups_query]
-
-        # 过滤掉完全暂停的群组
-        active_groups = []
-        for chat_id in all_groups:
-            # 检查该群组是否所有标签都被暂停
-            tags = list(
-                RandomSearchTag.select().where(RandomSearchTag.chat_id == chat_id)
-            )
-            if tags:
-                # 如果至少有一个标签未暂停，则认为群组是活跃的
-                if any(not tag.is_suspended for tag in tags):
-                    active_groups.append(chat_id)
-
-        return active_groups
+        query = (
+            RandomSearchTag.select(RandomSearchTag.chat_id)
+            .where(~RandomSearchTag.is_suspended)
+            .distinct()
+        )
+        return [row.chat_id for row in query]
     except Exception as e:
         logger.error(f"获取随机搜索群聊列表失败: {e}")
         return []
@@ -642,18 +654,27 @@ def cleanup_old_sent_illusts(days: int = 1):
 def filter_sent_illusts(illusts, chat_id: str) -> list:
     """过滤掉已发送的作品"""
     try:
-        # 获取所有已发送的作品ID
+        candidate_ids = [
+            getattr(illust, "id", None)
+            for illust in illusts
+            if getattr(illust, "id", None) is not None
+        ]
+        if not candidate_ids:
+            return list(illusts)
+
+        # 只查询当前候选中已发送的作品ID，避免读取该群全部历史记录
         sent_ids = set(
             record.illust_id
             for record in SentIllust.select(SentIllust.illust_id).where(
-                SentIllust.chat_id == chat_id
+                (SentIllust.chat_id == chat_id)
+                & (SentIllust.illust_id.in_(candidate_ids))
             )
         )
 
         # 过滤掉已发送的作品
         filtered_illusts = []
         for illust in illusts:
-            if illust.id not in sent_ids:
+            if getattr(illust, "id", None) not in sent_ids:
                 filtered_illusts.append(illust)
 
         logger.info(
@@ -816,22 +837,12 @@ def get_random_rankings(chat_id: str) -> list:
 def get_all_random_ranking_groups() -> list:
     """获取所有启用了随机排行榜的群聊ID"""
     try:
-        all_groups_query = RandomRankingConfig.select(
-            RandomRankingConfig.chat_id
-        ).distinct()
-        all_groups = [row.chat_id for row in all_groups_query]
-
-        active_groups = []
-        for chat_id in all_groups:
-            configs = list(
-                RandomRankingConfig.select().where(
-                    RandomRankingConfig.chat_id == chat_id
-                )
-            )
-            if configs and any(not c.is_suspended for c in configs):
-                active_groups.append(chat_id)
-
-        return active_groups
+        query = (
+            RandomRankingConfig.select(RandomRankingConfig.chat_id)
+            .where(~RandomRankingConfig.is_suspended)
+            .distinct()
+        )
+        return [row.chat_id for row in query]
     except Exception as e:
         logger.error(f"获取随机排行榜群聊列表失败: {e}")
         return []
