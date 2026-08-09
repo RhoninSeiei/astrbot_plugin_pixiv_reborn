@@ -405,7 +405,7 @@ class PixivSearchPlugin(Star):
 
     @command("pixiv_config")
     async def pixiv_config(
-        self, event: AstrMessageEvent, arg1: str = "", arg2: str = ""
+        self, event: AstrMessageEvent, arg1: str = "", arg2: str | None = None
     ):
         """查看或动态设置 Pixiv 插件参数（除 refresh_token）。"""
         # 使用配置管理器处理命令

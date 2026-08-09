@@ -459,14 +459,20 @@ class PixivConfigManager:
                 except ValueError:
                     return False, f"配置项 {key} 的值 '{value}' 不是有效的数字。"
             elif typ == "string":
-                if key in {"random_search_quiet_start", "random_search_quiet_end"}:
+                if key == "automatic_push_excluded_tags":
+                    normalized_tags = normalize_excluded_tags(value)
+                    self.config.automatic_push_excluded_tags = normalized_tags
+                    self.config.config[key] = ",".join(normalized_tags)
+                elif key in {"random_search_quiet_start", "random_search_quiet_end"}:
                     try:
                         from .random_schedule import parse_time_of_day
 
                         parse_time_of_day(value)
                     except ValueError:
                         return False, f"配置项 {key} 必须使用 HH:MM 格式，例如 00:00 或 08:30。"
-                setattr(self.config, key, value)
+                    setattr(self.config, key, value)
+                else:
+                    setattr(self.config, key, value)
 
             self.config.save_config()
             # 获取实际设置的值
@@ -517,12 +523,14 @@ class PixivConfigManager:
 
         return msg
 
-    async def handle_config_command(self, event, arg1: str = "", arg2: str = ""):
+    async def handle_config_command(
+        self, event, arg1: str = "", arg2: str | None = None
+    ):
         """处理配置命令"""
         args = []
         if arg1:
             args.append(arg1)
-        if arg2:
+        if arg2 is not None:
             args.append(arg2)
 
         if not args or (args and args[0].strip().lower() == "help"):
