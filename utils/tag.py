@@ -15,6 +15,35 @@ AI_BADWORDS = [s.lower() for s in ["AI", "AI生成", "AI-generated", "AI辅助"]
 _FILTER_CONFIG_SOURCE = None
 
 
+def normalize_excluded_tags(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = value.replace("，", ",").replace("、", ",")
+        values = normalized.split(",")
+    else:
+        values = list(value)
+
+    result = []
+    seen = set()
+    for value_item in values:
+        item = str(value_item or "").strip()
+        if item.startswith(("-", "－", "—", "–")):
+            item = item[1:].strip()
+        key = item.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
+
+
+def merge_excluded_tags(*values) -> list[str]:
+    merged = []
+    for value in values:
+        merged.extend(normalize_excluded_tags(value))
+    return normalize_excluded_tags(merged)
+
+
 def set_filter_config_source(config) -> None:
     """Bind the live plugin config so shared filters can read runtime thresholds."""
     global _FILTER_CONFIG_SOURCE

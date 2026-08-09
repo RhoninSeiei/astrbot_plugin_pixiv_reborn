@@ -107,6 +107,29 @@ class MetadataAndSchemaTest(unittest.TestCase):
             webui_schema["pixiv_api_retry_base_delay"]["max"],
         )
 
+    def test_automatic_push_exclusion_schema_is_exposed_to_dashboard_and_command(self):
+        install_config_import_stubs()
+        from utils.config import PixivConfigManager
+
+        webui_schema = json.loads(
+            (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+        )
+        command_schema = PixivConfigManager(object()).schema
+
+        self.assertEqual(
+            webui_schema["automatic_push_excluded_tags"],
+            {
+                "description": "自动推送统一排除标签",
+                "type": "string",
+                "hint": "随机标签、随机排行榜和画师订阅共同应用。使用逗号分隔；空字符串表示关闭。",
+                "default": "NTR,悪堕ち",
+            },
+        )
+        self.assertEqual(
+            command_schema["automatic_push_excluded_tags"],
+            {"type": "string"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

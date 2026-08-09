@@ -161,6 +161,12 @@
       "hint": "设置为 true 时，过滤内容时会输出提示信息；false 则不输出。",
       "default": true
   },
+  "automatic_push_excluded_tags": {
+      "description": "自动推送统一排除标签",
+      "type": "string",
+      "hint": "随机标签、随机排行榜和画师订阅共同应用。使用逗号分隔；空字符串表示关闭。",
+      "default": "NTR,悪堕ち"
+  },
   "single_response_mode": {
       "description": "单条合并消息模式",
       "type": "bool",

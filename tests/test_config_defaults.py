@@ -26,6 +26,24 @@ def install_import_stubs():
 
 
 class PixivConfigDefaultsTest(unittest.TestCase):
+    def test_automatic_push_exclusions_default_to_required_tags(self):
+        install_import_stubs()
+        from utils.config import PixivConfig
+
+        self.assertEqual(
+            PixivConfig({}).automatic_push_excluded_tags,
+            ["ntr", "悪堕ち"],
+        )
+
+    def test_automatic_push_exclusions_can_be_disabled(self):
+        install_import_stubs()
+        from utils.config import PixivConfig
+
+        self.assertEqual(
+            PixivConfig({"automatic_push_excluded_tags": ""}).automatic_push_excluded_tags,
+            [],
+        )
+
     def test_subscription_force_forward_defaults_to_direct_message(self):
         install_import_stubs()
         from utils.config import PixivConfig

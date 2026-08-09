@@ -1,7 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
-from utils.tag import FilterConfig, filter_illusts_with_reason
+from utils.tag import (
+    FilterConfig,
+    filter_illusts_with_reason,
+    merge_excluded_tags,
+    normalize_excluded_tags,
+)
 
 
 def make_illust(
@@ -42,6 +47,20 @@ def make_novel(*, novel_id: int):
         illust_ai_type=0,
         text_length=1200,
     )
+
+
+class AutomaticPushExclusionNormalizationTest(unittest.TestCase):
+    def test_normalize_automatic_exclusions_accepts_common_separators(self):
+        self.assertEqual(
+            normalize_excluded_tags(" NTR，悪堕ち、ntr "),
+            ["ntr", "悪堕ち"],
+        )
+
+    def test_merge_automatic_exclusions_preserves_first_seen_order(self):
+        self.assertEqual(
+            merge_excluded_tags(["custom", "NTR"], "ntr,悪堕ち"),
+            ["custom", "ntr", "悪堕ち"],
+        )
 
 
 class TagFilterThresholdTests(unittest.TestCase):

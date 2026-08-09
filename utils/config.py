@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Any
 from dataclasses import dataclass
 
+from .tag import normalize_excluded_tags
+
 
 async def clean_temp_dir(temp_dir: Path, max_files: int = 20) -> None:
     """
@@ -91,6 +93,9 @@ class PixivConfig:
         self.filter_r18g_only = self.config.get("filter_r18g_only", False)
         self.ai_filter_mode = self.config.get("ai_filter_mode", "过滤 AI 作品")
         self.ai_detection_mode = self.config.get("ai_detection_mode", "field_or_tag")
+        self.automatic_push_excluded_tags = normalize_excluded_tags(
+            self.config.get("automatic_push_excluded_tags", "NTR,悪堕ち")
+        )
         self.min_bookmarks = self.config.get("min_bookmarks", 0)
         self.min_views = self.config.get("min_views", 0)
         self.min_likes = self.config.get("min_likes", 0)
@@ -201,6 +206,7 @@ class PixivConfig:
             f"single_response_mode={self.single_response_mode}, "
             f"ai_filter_mode='{self.ai_filter_mode}', "
             f"ai_detection_mode='{self.ai_detection_mode}', "
+            f"automatic_push_excluded_tags={self.automatic_push_excluded_tags}, "
             f"min_bookmarks={self.min_bookmarks}, min_views={self.min_views}, min_likes={self.min_likes}, "
             f"show_details={self.show_details}, "
             f"refresh_interval={self.refresh_interval} 分钟, "
@@ -251,6 +257,7 @@ class PixivConfigManager:
                 "type": "enum",
                 "choices": ["field_or_tag", "field_only", "tag_only"],
             },
+            "automatic_push_excluded_tags": {"type": "string"},
             "min_bookmarks": {"type": "int", "min": 0, "max": 100000000},
             "min_views": {"type": "int", "min": 0, "max": 100000000},
             "min_likes": {"type": "int", "min": 0, "max": 100000000},
@@ -346,6 +353,7 @@ class PixivConfigManager:
             "filter_r18g_only",
             "ai_filter_mode",
             "ai_detection_mode",
+            "automatic_push_excluded_tags",
             "min_bookmarks",
             "min_views",
             "min_likes",

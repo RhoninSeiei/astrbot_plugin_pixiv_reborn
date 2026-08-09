@@ -239,6 +239,7 @@
 | `filter_r18g_only` | 是否额外过滤 R18G | false |
 | `ai_filter_mode` | AI作品显示设置 | 显示 AI 作品 |
 | `ai_detection_mode` | AI判定策略：`field_or_tag`/`field_only`/`tag_only` | field_or_tag |
+| `automatic_push_excluded_tags` | 自动推送统一排除标签，使用逗号分隔；留空关闭 | NTR,悪堕ち |
 | `min_bookmarks` | 过滤书签数小于该值的插画，0 表示关闭 | 0 |
 | `min_views` | 过滤阅读量小于该值的插画，0 表示关闭 | 0 |
 | `min_likes` | 过滤点赞数小于该值的插画，0 表示关闭；若 API 未返回点赞字段则自动忽略 | 0 |
