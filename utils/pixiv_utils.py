@@ -27,6 +27,8 @@ except Exception:
 _config = None
 _temp_dir = None
 PIXIV_IMAGE_PROXY = "i.pixiv.re"
+MULTI_PAGE_FULL_LIMIT = 9
+MULTI_PAGE_OVERFLOW_COUNT = 3
 
 
 def init_pixiv_utils(client: AppPixivAPI, config: PixivConfig, temp_dir: Path):
@@ -159,6 +161,72 @@ def _build_image_from_url(url: str) -> Optional[Image]:
         actual_url.startswith("http://") or actual_url.startswith("https://")
     ):
         return Image.fromURL(actual_url)
+    return None
+
+
+def get_illust_delivery_image_count(illust, send_all_pages: bool) -> int:
+    if getattr(illust, "type", None) == "ugoira":
+        return 1
+    if not send_all_pages:
+        return 1
+    page_count = max(1, int(getattr(illust, "page_count", 1) or 1))
+    return page_count if page_count <= MULTI_PAGE_FULL_LIMIT else MULTI_PAGE_OVERFLOW_COUNT
+
+
+def _select_illust_url_sources(illust, selected_count: int):
+    if int(getattr(illust, "page_count", 1) or 1) > 1:
+        return [
+            getattr(page, "image_urls", None)
+            for page in list(getattr(illust, "meta_pages", []) or [])[:selected_count]
+        ]
+
+    class SinglePageUrls:
+        def __init__(self, source_illust):
+            self.original = getattr(
+                getattr(source_illust, "meta_single_page", None),
+                "original_image_url",
+                None,
+            )
+            self.large = getattr(
+                getattr(source_illust, "image_urls", None), "large", None
+            )
+            self.medium = getattr(
+                getattr(source_illust, "image_urls", None), "medium", None
+            )
+
+    return [SinglePageUrls(illust)]
+
+
+async def _prepare_image_component(session: aiohttp.ClientSession, url_obj):
+    quality_preference = ["original", "large", "medium"]
+    start_index = (
+        quality_preference.index(_config.image_quality)
+        if _config.image_quality in quality_preference
+        else 0
+    )
+
+    for quality in quality_preference[start_index:]:
+        image_url = getattr(url_obj, quality, None)
+        if not image_url:
+            continue
+
+        logger.info(f"Pixiv 插件：尝试发送图片，质量: {quality}, URL: {image_url}")
+        try:
+            if _config.image_send_method == "url":
+                image_component = _build_image_from_url(image_url)
+                if image_component:
+                    return image_component
+
+            image_data = await download_image(session, image_url)
+            if image_data:
+                return await _build_image_from_bytes(image_data)
+            logger.warning(
+                f"Pixiv 插件：图片下载失败(质量: {quality})。尝试下一个质量..."
+            )
+        except Exception as e:
+            logger.error(
+                f"Pixiv 插件：图片下载异常(质量: {quality}) - {e}。尝试下一个质量..."
+            )
     return None
 
 
@@ -563,80 +631,26 @@ async def send_pixiv_image(
 
     await smart_clean_temp_dir(_temp_dir, probability=0.1, max_files=20)
 
-    url_sources = []  # 元组列表: (url_object, detail_message_for_page)
-
-    # 辅助类，用于统一单页插画的URL结构
-    class SinglePageUrls:
-        def __init__(self, illust):
-            self.original = getattr(illust.meta_single_page, "original_image_url", None)
-            self.large = getattr(illust.image_urls, "large", None)
-            self.medium = getattr(illust.image_urls, "medium", None)
-
-    if send_all_pages and illust.page_count > 1:
-        for i, page in enumerate(illust.meta_pages):
-            page_detail = f"第 {i + 1}/{illust.page_count} 页\n{detail_message or ''}"
-            # 对于多页作品，page.image_urls 包含 original, large, medium
-            url_sources.append((page.image_urls, page_detail))
-    else:
-        if illust.page_count > 1:
-            # 多页作品的第一页
-            url_obj = illust.meta_pages[0].image_urls
-        else:
-            # 单页作品
-            url_obj = SinglePageUrls(illust)
-        url_sources.append((url_obj, detail_message))
-
-    for url_obj, msg in url_sources:
-        quality_preference = ["original", "large", "medium"]
-        start_index = (
-            quality_preference.index(_config.image_quality)
-            if _config.image_quality in quality_preference
-            else 0
-        )
-        qualities_to_try = quality_preference[start_index:]
-
-        image_sent_for_source = False
-        for quality in qualities_to_try:
-            image_url = getattr(url_obj, quality, None)
-            if not image_url:
-                continue
-
-            logger.info(f"Pixiv 插件：尝试发送图片，质量: {quality}, URL: {image_url}")
-            try:
-                # 优先尝试 URL 直接发送（不需要下载，节省内存和时间）
-                if _config.image_send_method == "url":
-                    img_comp = _build_image_from_url(image_url)
-                    if img_comp:
-                        if show_details and msg:
-                            yield event.chain_result([img_comp, Plain(msg)])
-                        else:
-                            yield event.chain_result([img_comp])
-                        image_sent_for_source = True
-                        break
-
-                # URL 发送不可用或配置为文件发送，则下载后发送
-                async with aiohttp.ClientSession() as session:
-                    img_data = await download_image(session, image_url)
-                    if img_data:
-                        img_comp = await _build_image_from_bytes(img_data)
-                        if show_details and msg:
-                            yield event.chain_result([img_comp, Plain(msg)])
-                        else:
-                            yield event.chain_result([img_comp])
-
-                        image_sent_for_source = True
-                        break  # 此源成功，移动到下一个源
-                    else:
-                        logger.warning(
-                            f"Pixiv 插件：图片下载失败 (质量: {quality})。尝试下一质量..."
-                        )
-            except Exception as e:
-                logger.error(
-                    f"Pixiv 插件：图片下载异常 (质量: {quality}) - {e}。尝试下一质量..."
+    selected_count = get_illust_delivery_image_count(illust, send_all_pages)
+    selected_sources = _select_illust_url_sources(illust, selected_count)
+    components = []
+    async with aiohttp.ClientSession() as session:
+        for url_obj in selected_sources:
+            component = await _prepare_image_component(session, url_obj)
+            if component is None:
+                await cleanup_pixiv_temp_files(components)
+                yield event.plain_result(
+                    "图片下载失败，仅发送信息：\n" + (detail_message or "")
                 )
+                return
+            components.append(component)
 
-        if not image_sent_for_source:
-            yield event.plain_result(f"图片下载失败，仅发送信息：\n{msg or ''}")
+    details = detail_message or ""
+    if int(getattr(illust, "page_count", 1) or 1) >= 10:
+        details = f"{details}\n作品ID: {illust.id}".strip()
+    if show_details and details:
+        components.append(Plain(details))
+    yield event.chain_result(components)
 
 
 async def send_ugoira(

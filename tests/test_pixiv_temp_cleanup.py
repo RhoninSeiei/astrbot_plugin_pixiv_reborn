@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -51,6 +50,32 @@ class FakeMessageChain:
         self.chain = chain
 
 
+class FakeClientSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        pass
+
+
+class FakeAsyncFile:
+    def __init__(self, path, mode):
+        self.file = open(path, mode)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self.file.close()
+
+    async def write(self, data):
+        return self.file.write(data)
+
+
+def fake_aiofiles_open(path, mode, **kwargs):
+    return FakeAsyncFile(path, mode)
+
+
 def install_import_stubs():
     astrbot = types.ModuleType("astrbot")
     astrbot_api = types.ModuleType("astrbot.api")
@@ -62,11 +87,18 @@ def install_import_stubs():
     message_components.Nodes = object
     pixivpy3 = types.ModuleType("pixivpy3")
     pixivpy3.AppPixivAPI = object
+    aiohttp = types.ModuleType("aiohttp")
+    aiohttp.ClientSession = FakeClientSession
+    aiohttp.ClientTimeout = lambda **kwargs: object()
+    aiofiles = types.ModuleType("aiofiles")
+    aiofiles.open = fake_aiofiles_open
 
     sys.modules.setdefault("astrbot", astrbot)
     sys.modules["astrbot.api"] = astrbot_api
     sys.modules["astrbot.api.message_components"] = message_components
     sys.modules["pixivpy3"] = pixivpy3
+    sys.modules["aiohttp"] = aiohttp
+    sys.modules["aiofiles"] = aiofiles
 
 
 class PixivTempCleanupTest(unittest.IsolatedAsyncioTestCase):
@@ -74,20 +106,19 @@ class PixivTempCleanupTest(unittest.IsolatedAsyncioTestCase):
         install_import_stubs()
         from utils import pixiv_utils
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pixiv_utils._temp_dir = Path(temp_dir)
-            pixiv_utils._config = types.SimpleNamespace(
-                image_send_method="file",
-                pil_compress_quality=100,
-                pil_compress_target_kb=0,
-            )
+        pixiv_utils._temp_dir = Path(__file__).resolve().parents[1] / ".tmp"
+        pixiv_utils._config = types.SimpleNamespace(
+            image_send_method="file",
+            pil_compress_quality=100,
+            pil_compress_target_kb=0,
+        )
 
-            image = await pixiv_utils._build_image_from_bytes(b"image-bytes")
-            self.assertTrue(Path(image.path).exists())
+        image = await pixiv_utils._build_image_from_bytes(b"image-bytes")
+        self.assertTrue(Path(image.path).exists())
 
-            await pixiv_utils.cleanup_pixiv_temp_files(FakeMessageChain([image]))
+        await pixiv_utils.cleanup_pixiv_temp_files(FakeMessageChain([image]))
 
-            self.assertFalse(Path(image.path).exists())
+        self.assertFalse(Path(image.path).exists())
 
 
 if __name__ == "__main__":
