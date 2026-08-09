@@ -245,6 +245,104 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(updated_illust_ids, [])
 
+    async def test_artist_update_plain_atomic_failure_chain_keeps_cursor(self):
+        subscription = load_subscription_module()
+        sent_messages = []
+        updated_illust_ids = []
+
+        async def second_page_failure_chain(*args, **kwargs):
+            failure = FakeMessageChain()
+            failure.chain = [FakePlain("page 2 delivery failed")]
+            yield failure
+
+        class FakeContext:
+            async def send_message(self, session_id, message):
+                sent_messages.append((session_id, message))
+
+        original_filter_items = subscription.filter_items
+        original_send_pixiv_image = subscription.send_pixiv_image
+        original_update_last_notified_id = subscription.update_last_notified_id
+        try:
+            subscription.filter_items = lambda *args, **kwargs: ([FakeIllust(2)], [])
+            subscription.send_pixiv_image = second_page_failure_chain
+            subscription.update_last_notified_id = (
+                lambda chat_id, sub_type, target_id, illust_id: updated_illust_ids.append(
+                    illust_id
+                )
+            )
+
+            service = object.__new__(subscription.SubscriptionService)
+            service.client = FakeClient()
+            service.context = FakeContext()
+            service.pixiv_config = types.SimpleNamespace(
+                automatic_push_excluded_tags=[],
+                show_details=True,
+                subscription_force_forward=False,
+            )
+            sub = types.SimpleNamespace(
+                target_id="123",
+                target_name="artist",
+                last_notified_illust_id=1,
+                chat_id="456",
+                session_id="session",
+                sub_type="artist",
+            )
+
+            await service.check_artist_updates(sub)
+        finally:
+            subscription.filter_items = original_filter_items
+            subscription.send_pixiv_image = original_send_pixiv_image
+            subscription.update_last_notified_id = original_update_last_notified_id
+
+        self.assertEqual(updated_illust_ids, [])
+        self.assertEqual(len(sent_messages), 1)
+        self.assertEqual(
+            [component.text for component in sent_messages[0][1].chain],
+            ["page 2 delivery failed"],
+        )
+
+    async def test_subscription_force_forward_wraps_atomic_chain_in_one_node(self):
+        subscription = load_subscription_module()
+        sent_messages = []
+        atomic_chain = FakeMessageChain()
+        atomic_chain.chain = [FakeImage(), FakeImage(), FakePlain("details")]
+
+        async def atomic_multi_page_delivery(*args, **kwargs):
+            yield atomic_chain
+
+        class FakeContext:
+            async def send_message(self, session_id, message):
+                sent_messages.append((session_id, message))
+
+        original_send_pixiv_image = subscription.send_pixiv_image
+        subscription.send_pixiv_image = atomic_multi_page_delivery
+        try:
+            service = object.__new__(subscription.SubscriptionService)
+            service.client = object()
+            service.context = FakeContext()
+            service.pixiv_config = types.SimpleNamespace(
+                show_details=True, subscription_force_forward=True
+            )
+            sub = types.SimpleNamespace(
+                session_id="session", sub_type="artist", target_name="artist"
+            )
+
+            image_sent = await service.send_update(sub, FakeIllust(2))
+        finally:
+            subscription.send_pixiv_image = original_send_pixiv_image
+
+        self.assertTrue(image_sent)
+        self.assertEqual(len(sent_messages), 1)
+        self.assertEqual(sent_messages[0][0], "session")
+        forwarded_chain = sent_messages[0][1]
+        self.assertIsInstance(forwarded_chain, FakeMessageChain)
+        self.assertEqual(len(forwarded_chain.chain), 1)
+        self.assertIsInstance(forwarded_chain.chain[0], FakeNodes)
+        nodes = forwarded_chain.chain[0].kwargs["nodes"]
+        self.assertEqual(len(nodes), 1)
+        self.assertIsInstance(nodes[0], FakeNode)
+        self.assertEqual(nodes[0].kwargs["content"], atomic_chain.chain)
+
 
 if __name__ == "__main__":
     unittest.main()
