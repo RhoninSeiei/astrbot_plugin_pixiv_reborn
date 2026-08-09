@@ -82,12 +82,14 @@ class FakeUser:
 
 
 class FakeIllust:
-    def __init__(self, illust_id):
+    def __init__(self, illust_id, page_count=1, tags=None):
         self.id = illust_id
         self.title = f"title-{illust_id}"
         self.user = FakeUser()
-        self.tags = []
+        self.tags = tags or []
         self.type = "illust"
+        self.page_count = page_count
+        self.delivery_image_count = 3 if page_count > 9 else page_count
 
 
 class FakeSearchResult:
@@ -165,6 +167,11 @@ def install_import_stubs(data_dir):
     pixiv_utils = types.ModuleType("utils.pixiv_utils")
     pixiv_utils.send_pixiv_image = fake_send_pixiv_image
     pixiv_utils.cleanup_pixiv_temp_files = lambda message_content: _noop_async()
+    pixiv_utils.get_illust_delivery_image_count = (
+        lambda illust, send_all_pages: illust.delivery_image_count
+        if send_all_pages
+        else 1
+    )
 
     database = types.ModuleType("utils.database")
     database.get_all_random_search_groups = lambda: []
@@ -197,6 +204,12 @@ def install_import_stubs(data_dir):
 
 
 class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        sys.modules.pop("utils.database", None)
+        utils_package = sys.modules.get("utils")
+        if utils_package is not None:
+            utils_package.__dict__.pop("database", None)
+
     def _make_service(self, random_search):
         service = object.__new__(random_search.RandomSearchService)
         service.client = object()
@@ -278,7 +291,9 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             attempts = []
             sent_records = []
 
-            async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            async def fake_send_pixiv_image(
+                client, event, illust, detail, show_details, send_all_pages=False
+            ):
                 calls[illust.id] += 1
                 if illust.id in fail_ids:
                     yield event.plain_result("图片下载失败，仅发送信息：\n标题: failed")
@@ -419,7 +434,9 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             sent_records = []
             filter_call_sizes = []
 
-            async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            async def fake_send_pixiv_image(
+                client, event, illust, detail, show_details, send_all_pages=False
+            ):
                 yield event.plain_result(f"标题: {illust.title}")
 
             def fake_filter_sent_illusts(illusts, chat_id):
@@ -550,7 +567,10 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             ):
                 if illust.id == 2:
                     self.assertEqual(sent_records, [(1, "172448191")])
-                return {illust.id}
+                return random_search.RandomIllustDeliveryResult(
+                    illust_ids=frozenset({illust.id}),
+                    image_count=1,
+                )
 
             originals = {
                 "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
@@ -586,6 +606,199 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.had_sendable_candidates)
             self.assertEqual(result.sent_count, 2)
             self.assertEqual(sent_records, [(1, "172448191"), (2, "172448191")])
+
+    async def test_retry_returns_illust_ids_and_delivered_image_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            send_all_pages_values = []
+
+            async def fake_send_pixiv_image(
+                client, event, illust, detail, show_details, send_all_pages=False
+            ):
+                send_all_pages_values.append(send_all_pages)
+                yield event.plain_result(f"title: {illust.title}")
+
+            original = random_search.send_pixiv_image
+            random_search.send_pixiv_image = fake_send_pixiv_image
+            try:
+                result = await service._send_random_illust_with_retry(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="test",
+                    illust=FakeIllust(148023016, page_count=2),
+                    config=self._make_config(random_search, return_count=3),
+                )
+            finally:
+                random_search.send_pixiv_image = original
+
+            self.assertEqual(result.illust_ids, frozenset({148023016}))
+            self.assertEqual(result.image_count, 2)
+            self.assertEqual(send_all_pages_values, [True])
+
+    async def test_image_budget_stops_after_delivered_multi_page_illust(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            sent_candidate_ids = []
+            sent_records = []
+
+            async def fake_send_random_illust_with_retry(
+                chat_id, session_id, source_type, source_name, illust, config
+            ):
+                sent_candidate_ids.append(illust.id)
+                return random_search.RandomIllustDeliveryResult(
+                    illust_ids=frozenset({illust.id}),
+                    image_count=illust.delivery_image_count,
+                )
+
+            originals = {
+                "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
+                "add_sent_illust": random_search.add_sent_illust,
+                "shuffle": random_search.random.shuffle,
+            }
+            random_search.filter_illusts_with_reason = (
+                lambda illusts, config: (list(illusts), [])
+            )
+            random_search.add_sent_illust = (
+                lambda illust_id, chat_id: sent_records.append((illust_id, chat_id))
+            )
+            random_search.random.shuffle = lambda items: None
+            service._send_random_illust_with_retry = fake_send_random_illust_with_retry
+            try:
+                result = await service._send_random_illusts_with_fallback(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="test",
+                    initial_illusts=[
+                        FakeIllust(1, page_count=1),
+                        FakeIllust(2, page_count=5),
+                        FakeIllust(3, page_count=1),
+                    ],
+                    config=self._make_config(random_search, return_count=3),
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "shuffle" else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertEqual(sent_candidate_ids, [1, 2])
+            self.assertEqual(result.sent_count, 2)
+            self.assertEqual(result.sent_image_count, 6)
+            self.assertEqual(sent_records, [(1, "172448191"), (2, "172448191")])
+            self.assertNotIn((3, "172448191"), sent_records)
+
+    async def test_ten_page_illust_counts_as_three_delivered_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+
+            async def fake_send_random_illust_with_retry(
+                chat_id, session_id, source_type, source_name, illust, config
+            ):
+                return random_search.RandomIllustDeliveryResult(
+                    illust_ids=frozenset({illust.id}),
+                    image_count=illust.delivery_image_count,
+                )
+
+            originals = {
+                "filter_illusts_with_reason": random_search.filter_illusts_with_reason,
+                "shuffle": random_search.random.shuffle,
+            }
+            random_search.filter_illusts_with_reason = (
+                lambda illusts, config: (list(illusts), [])
+            )
+            random_search.random.shuffle = lambda items: None
+            service._send_random_illust_with_retry = fake_send_random_illust_with_retry
+            try:
+                result = await service._send_random_illusts_with_fallback(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="test",
+                    initial_illusts=[FakeIllust(10, page_count=10)],
+                    config=self._make_config(random_search, return_count=3),
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "shuffle" else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertEqual(result.sent_count, 1)
+            self.assertEqual(result.sent_image_count, 3)
+
+    async def test_automatic_excluded_candidates_are_never_sent_or_cached(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            service.pixiv_config = self._make_pixiv_config()
+            service.pixiv_config.automatic_push_excluded_tags = ["excluded"]
+            service._resolve_group_runtime_config = lambda chat_id: types.SimpleNamespace(
+                return_count=2,
+                min_likes=0,
+            )
+            config = service._build_filter_config("random:test", [], "172448191")
+            sent_candidate_ids = []
+            sent_records = []
+
+            async def fake_send_random_illust_with_retry(
+                chat_id, session_id, source_type, source_name, illust, config
+            ):
+                sent_candidate_ids.append(illust.id)
+                return random_search.RandomIllustDeliveryResult(
+                    illust_ids=frozenset({illust.id}),
+                    image_count=1,
+                )
+
+            originals = {
+                "add_sent_illust": random_search.add_sent_illust,
+                "shuffle": random_search.random.shuffle,
+            }
+            random_search.add_sent_illust = (
+                lambda illust_id, chat_id: sent_records.append((illust_id, chat_id))
+            )
+            random_search.random.shuffle = lambda items: None
+            service._send_random_illust_with_retry = fake_send_random_illust_with_retry
+            try:
+                result = await service._send_random_illusts_with_fallback(
+                    chat_id="172448191",
+                    session_id="default:GroupMessage:172448191",
+                    source_type="tag",
+                    source_name="test",
+                    initial_illusts=[
+                        FakeIllust(1, tags=["automatic-excluded"]),
+                        FakeIllust(2, tags=["allowed"]),
+                    ],
+                    config=config,
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(
+                        random_search.random if name == "shuffle" else random_search,
+                        name,
+                        value,
+                    )
+
+            self.assertTrue(result.had_sendable_candidates)
+            self.assertEqual(sent_candidate_ids, [2])
+            self.assertEqual(sent_records, [(2, "172448191")])
+            self.assertNotIn((1, "172448191"), sent_records)
 
 
 async def _noop_async():

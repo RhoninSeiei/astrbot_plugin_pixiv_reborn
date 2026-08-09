@@ -31,7 +31,11 @@ from .tag import (
     filter_illusts_with_reason,
     merge_excluded_tags,
 )
-from .pixiv_utils import send_pixiv_image, cleanup_pixiv_temp_files
+from .pixiv_utils import (
+    send_pixiv_image,
+    cleanup_pixiv_temp_files,
+    get_illust_delivery_image_count,
+)
 from .random_empty_retry import (
     build_retry_source_sequence,
     enforce_random_push_delivery_policy,
@@ -47,6 +51,13 @@ class RandomSearchExecutionResult:
     completed: bool = True
     had_sendable_candidates: bool = False
     sent_count: int = 0
+    sent_image_count: int = 0
+
+
+@dataclass(frozen=True)
+class RandomIllustDeliveryResult:
+    illust_ids: frozenset[int] = frozenset()
+    image_count: int = 0
 
 
 class RandomSearchService:
@@ -400,6 +411,7 @@ class RandomSearchService:
                     illust,
                     detail_message,
                     show_details=config.show_details,
+                    send_all_pages=True,
                 ):
                     yielded_message = True
                     if is_random_push_image_failure_notice(message_content):
@@ -429,7 +441,10 @@ class RandomSearchService:
                         failure_log=f"向 {session_id} 发送消息失败",
                     )
                     if sent_ids:
-                        return sent_ids
+                        return RandomIllustDeliveryResult(
+                            illust_ids=frozenset(sent_ids),
+                            image_count=get_illust_delivery_image_count(illust, True),
+                        )
 
                     logger.warning(
                         "随机推送消息发送失败，作品 %s 第 %s/%s 次尝试失败。"
@@ -476,7 +491,7 @@ class RandomSearchService:
             "随机推送作品 %s 连续 %s 次下载或发送失败，准备尝试其他候选作品。"
             % (illust_id or "unknown", self.RANDOM_IMAGE_SEND_RETRIES)
         )
-        return set()
+        return RandomIllustDeliveryResult()
 
     async def _send_random_illusts_with_fallback(
         self,
@@ -523,13 +538,14 @@ class RandomSearchService:
             return RandomSearchExecutionResult(had_sendable_candidates=True)
 
         sent_illust_ids = set()
+        sent_image_count = 0
         consecutive_failures = 0
 
         for illust in candidates:
-            if len(sent_illust_ids) >= target_count:
+            if sent_image_count >= target_count:
                 break
 
-            sent_ids = await self._send_random_illust_with_retry(
+            delivery = await self._send_random_illust_with_retry(
                 chat_id=chat_id,
                 session_id=session_id,
                 source_type=source_type,
@@ -537,11 +553,12 @@ class RandomSearchService:
                 illust=illust,
                 config=config,
             )
-            if sent_ids:
-                new_sent_ids = set(sent_ids) - sent_illust_ids
+            if delivery.illust_ids:
+                new_sent_ids = set(delivery.illust_ids) - sent_illust_ids
                 for illust_id in new_sent_ids:
                     await asyncio.to_thread(add_sent_illust, illust_id, chat_id)
-                sent_illust_ids.update(sent_ids)
+                sent_illust_ids.update(delivery.illust_ids)
+                sent_image_count += delivery.image_count
                 consecutive_failures = 0
                 continue
 
@@ -564,6 +581,7 @@ class RandomSearchService:
         return RandomSearchExecutionResult(
             had_sendable_candidates=True,
             sent_count=len(sent_illust_ids),
+            sent_image_count=sent_image_count,
         )
 
     async def _scheduler_tick(self):
