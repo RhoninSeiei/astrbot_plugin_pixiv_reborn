@@ -3,10 +3,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-from tests.test_random_push_retry import install_import_stubs
+from tests.test_random_push_retry import install_import_stubs, remove_import_stubs
 
 
 class RandomSearchScheduleClaimTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        remove_import_stubs()
+
     async def test_scheduler_tick_claims_due_group_without_pre_scheduling_next_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             install_import_stubs(temp_dir)

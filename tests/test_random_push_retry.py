@@ -189,7 +189,7 @@ def install_import_stubs(data_dir):
     database.get_random_search_group_config = lambda chat_id: None
     database.add_random_search_send_attempt = lambda **kwargs: None
     database.try_claim_random_search_execution = lambda **kwargs: True
-    database.release_random_search_execution = lambda **kwargs: None
+    database.release_random_search_execution = lambda *args, **kwargs: None
 
     sys.modules.setdefault("astrbot", astrbot)
     sys.modules["astrbot.api"] = astrbot_api
@@ -204,12 +204,22 @@ def install_import_stubs(data_dir):
     sys.modules["utils.pixiv_utils"] = pixiv_utils
 
 
+def remove_import_stubs():
+    for module_name in (
+        "utils.database",
+        "utils.pixiv_utils",
+        "utils.random_search",
+    ):
+        sys.modules.pop(module_name, None)
+    utils_package = sys.modules.get("utils")
+    if utils_package is not None:
+        for attr_name in ("database", "pixiv_utils", "random_search"):
+            utils_package.__dict__.pop(attr_name, None)
+
+
 class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
-        sys.modules.pop("utils.database", None)
-        utils_package = sys.modules.get("utils")
-        if utils_package is not None:
-            utils_package.__dict__.pop("database", None)
+        remove_import_stubs()
 
     def _make_service(self, random_search):
         service = object.__new__(random_search.RandomSearchService)

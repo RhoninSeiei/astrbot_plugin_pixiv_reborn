@@ -3,10 +3,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-from tests.test_random_push_retry import install_import_stubs
+from tests.test_random_push_retry import install_import_stubs, remove_import_stubs
 
 
 class RandomSearchAsyncDatabaseTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        remove_import_stubs()
+
     def _make_service(self, random_search):
         service = object.__new__(random_search.RandomSearchService)
         service.client = object()
