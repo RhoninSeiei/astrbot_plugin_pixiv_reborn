@@ -7,3 +7,4 @@ __pycache__/
 data/t2i_templates/
 data/cmd_config.json
 .ace-tool/
+.worktrees/
