@@ -158,6 +158,31 @@ def install_import_stubs(data_dir):
     pixivpy3 = types.ModuleType("pixivpy3")
     pixivpy3.AppPixivAPI = object
 
+    async def fake_send_pixiv_image(*args, **kwargs):
+        if False:
+            yield None
+
+    pixiv_utils = types.ModuleType("utils.pixiv_utils")
+    pixiv_utils.send_pixiv_image = fake_send_pixiv_image
+    pixiv_utils.cleanup_pixiv_temp_files = lambda message_content: _noop_async()
+
+    database = types.ModuleType("utils.database")
+    database.get_all_random_search_groups = lambda: []
+    database.get_random_tags = lambda chat_id: []
+    database.filter_sent_illusts = lambda illusts, chat_id: illusts
+    database.add_sent_illust = lambda illust_id, chat_id: None
+    database.cleanup_old_sent_illusts = lambda: None
+    database.get_schedule_time = lambda chat_id: None
+    database.set_schedule_time = lambda chat_id, schedule_time: None
+    database.remove_schedule_time = lambda chat_id: None
+    database.get_all_schedule_times = lambda: []
+    database.get_all_random_ranking_groups = lambda: []
+    database.get_random_rankings = lambda chat_id: []
+    database.get_random_search_group_config = lambda chat_id: None
+    database.add_random_search_send_attempt = lambda **kwargs: None
+    database.try_claim_random_search_execution = lambda **kwargs: True
+    database.release_random_search_execution = lambda **kwargs: None
+
     sys.modules.setdefault("astrbot", astrbot)
     sys.modules["astrbot.api"] = astrbot_api
     sys.modules["astrbot.api.star"] = astrbot_star
@@ -167,6 +192,8 @@ def install_import_stubs(data_dir):
     sys.modules["apscheduler.schedulers"] = apscheduler_schedulers
     sys.modules["apscheduler.schedulers.asyncio"] = apscheduler_asyncio
     sys.modules["pixivpy3"] = pixivpy3
+    sys.modules["utils.database"] = database
+    sys.modules["utils.pixiv_utils"] = pixiv_utils
 
 
 class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
@@ -201,7 +228,46 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             random_search_empty_retry_enabled=True,
             random_search_empty_retry_extra_depth=3,
             random_search_empty_retry_sources=0,
+            automatic_push_excluded_tags=[],
         )
+
+    def test_random_filter_config_merges_source_and_automatic_exclusions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            service.pixiv_config = self._make_pixiv_config()
+            service.pixiv_config.automatic_push_excluded_tags = ["ntr", "悪堕ち"]
+            service._resolve_group_runtime_config = lambda chat_id: types.SimpleNamespace(
+                return_count=1,
+                min_likes=0,
+            )
+
+            config = service._build_filter_config(
+                "random:test",
+                ["custom", "ntr"],
+                "905956314",
+            )
+
+            self.assertEqual(config.excluded_tags, ["custom", "ntr", "悪堕ち"])
+
+    def test_random_ranking_filter_config_uses_automatic_exclusions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            service = self._make_service(random_search)
+            service.pixiv_config = self._make_pixiv_config()
+            service.pixiv_config.automatic_push_excluded_tags = ["ntr", "悪堕ち"]
+            service._resolve_group_runtime_config = lambda chat_id: types.SimpleNamespace(
+                return_count=1,
+                min_likes=0,
+            )
+
+            config = service._build_filter_config("random:ranking", [], "905956314")
+
+            self.assertEqual(config.excluded_tags, ["ntr", "悪堕ち"])
 
     async def _run_with_patches(self, fail_ids, return_count):
         with tempfile.TemporaryDirectory() as temp_dir:

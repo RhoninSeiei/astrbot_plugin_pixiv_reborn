@@ -29,6 +29,7 @@ from .tag import (
     FilterConfig,
     validate_and_process_tags,
     filter_illusts_with_reason,
+    merge_excluded_tags,
 )
 from .pixiv_utils import send_pixiv_image, cleanup_pixiv_temp_files
 from .random_empty_retry import (
@@ -219,6 +220,10 @@ class RandomSearchService:
 
     def _build_filter_config(self, display_tag_str: str, exclude_tags, chat_id: str):
         group_config = self._resolve_group_runtime_config(chat_id)
+        excluded_tags = merge_excluded_tags(
+            exclude_tags,
+            self.pixiv_config.automatic_push_excluded_tags,
+        )
         return FilterConfig(
             **enforce_random_push_delivery_policy(
                 {
@@ -231,7 +236,7 @@ class RandomSearchService:
                     "logger": logger,
                     "show_filter_result": self.pixiv_config.show_filter_result,
                     "single_response_mode": self.pixiv_config.single_response_mode,
-                    "excluded_tags": exclude_tags or [],
+                    "excluded_tags": excluded_tags,
                     "forward_threshold": self.pixiv_config.forward_threshold,
                     "show_details": self.pixiv_config.show_details,
                     "min_likes": group_config.min_likes,

@@ -78,7 +78,9 @@ class SubscriptionService:
             new_illusts.reverse()
             for illust in new_illusts:
                 filtered_illusts, _ = filter_items(
-                    [illust], f"画师订阅: {sub.target_name}"
+                    [illust],
+                    f"画师订阅: {sub.target_name}",
+                    excluded_tags=self.pixiv_config.automatic_push_excluded_tags,
                 )
                 if filtered_illusts:
                     sent_ok = await self.send_update(sub, filtered_illusts[0])
