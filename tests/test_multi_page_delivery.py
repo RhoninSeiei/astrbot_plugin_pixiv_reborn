@@ -107,9 +107,11 @@ def install_import_stubs():
     sys.modules["aiofiles"] = aiofiles
 
 
-def fake_illust(page_count, illust_id=148023016):
+def fake_illust(page_count, illust_id=148023016, available_page_count=None):
     pages = []
-    for index in range(page_count):
+    for index in range(
+        page_count if available_page_count is None else available_page_count
+    ):
         pages.append(
             types.SimpleNamespace(
                 image_urls=types.SimpleNamespace(
@@ -146,17 +148,26 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
             use_image_proxy=False,
             proxy="",
         )
-        self.pixiv_utils._temp_dir = None
+        self.temp_dir = Path(__file__).resolve().parents[1] / ".tmp"
+        self.created_temp_dir = not self.temp_dir.exists()
+        self.temp_dir.mkdir(exist_ok=True)
+        self.pixiv_utils._temp_dir = self.temp_dir
         self.original_smart_clean = self.pixiv_utils.smart_clean_temp_dir
         self.pixiv_utils.smart_clean_temp_dir = self._noop_smart_clean
 
     async def asyncTearDown(self):
         self.pixiv_utils.smart_clean_temp_dir = self.original_smart_clean
+        for path in self.temp_dir.glob("pixiv_*"):
+            path.unlink(missing_ok=True)
+        if self.created_temp_dir:
+            self.temp_dir.rmdir()
 
     async def _noop_smart_clean(self, *args, **kwargs):
         pass
 
-    async def _collect_delivery(self, illust, detail_message="details"):
+    async def _collect_delivery(
+        self, illust, detail_message="details", send_all_pages=True
+    ):
         return [
             result
             async for result in self.pixiv_utils.send_pixiv_image(
@@ -164,7 +175,7 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
                 FakeEvent(),
                 illust,
                 detail_message=detail_message,
-                send_all_pages=True,
+                send_all_pages=send_all_pages,
             )
         ]
 
@@ -196,6 +207,10 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         images = [component for component in results[0].chain if isinstance(component, FakeImage)]
         details = [component for component in results[0].chain if isinstance(component, FakePlain)]
         self.assertEqual(len(images), 9)
+        self.assertEqual(
+            [component.url for component in images],
+            [f"https://example.test/{index}.jpg" for index in range(9)],
+        )
         self.assertEqual([component.text for component in details], ["details"])
 
     async def test_ten_pages_yield_three_images_and_one_work_id(self):
@@ -206,7 +221,61 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         images = [component for component in results[0].chain if isinstance(component, FakeImage)]
         details = [component.text for component in results[0].chain if isinstance(component, FakePlain)]
         self.assertEqual(len(images), 3)
+        self.assertEqual(
+            [component.url for component in images],
+            ["https://example.test/0.jpg", "https://example.test/1.jpg", "https://example.test/2.jpg"],
+        )
         self.assertEqual("\n".join(details).count("作品ID: 148023016"), 1)
+
+    async def test_ten_page_default_delivery_does_not_append_work_id(self):
+        results = await self._collect_delivery(
+            fake_illust(10), send_all_pages=False
+        )
+
+        details = [
+            component.text for component in results[0].chain if isinstance(component, FakePlain)
+        ]
+        self.assertEqual(details, ["details"])
+
+    async def test_available_meta_pages_limit_delivery_count_and_components(self):
+        illust = fake_illust(3, available_page_count=2)
+
+        self.assertEqual(
+            self.pixiv_utils.get_illust_delivery_image_count(illust, True), 2
+        )
+        results = await self._collect_delivery(illust)
+
+        images = [component for component in results[0].chain if isinstance(component, FakeImage)]
+        self.assertEqual(len(images), 2)
+        self.assertEqual(
+            [component.url for component in images],
+            ["https://example.test/0.jpg", "https://example.test/1.jpg"],
+        )
+
+    async def test_existing_work_id_is_not_duplicated_for_truncated_delivery(self):
+        results = await self._collect_delivery(
+            fake_illust(10), "details\n作品ID: 148023016"
+        )
+
+        details = [
+            component.text for component in results[0].chain if isinstance(component, FakePlain)
+        ]
+        self.assertEqual("\n".join(details).count("作品ID: 148023016"), 1)
+
+    async def test_url_delivery_does_not_create_a_client_session(self):
+        original_session = self.pixiv_utils.aiohttp.ClientSession
+
+        def fail_client_session():
+            raise AssertionError("URL delivery must not create a client session")
+
+        self.pixiv_utils.aiohttp.ClientSession = fail_client_session
+        try:
+            results = await self._collect_delivery(fake_illust(1))
+        finally:
+            self.pixiv_utils.aiohttp.ClientSession = original_session
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chain[0].url, "https://example.test/single.jpg")
 
     async def test_file_mode_failure_cleans_built_page_and_yields_only_failure(self):
         self.pixiv_utils._config.image_send_method = "file"
@@ -226,7 +295,6 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.pixiv_utils.download_image = fake_download
         self.pixiv_utils._build_image_from_bytes = fake_build
         try:
-            self.pixiv_utils._temp_dir = Path(__file__).resolve().parents[1] / ".tmp"
             results = await self._collect_delivery(fake_illust(2))
 
             self.assertEqual(len(results), 1)
@@ -237,6 +305,67 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
                 page_one_path.unlink(missing_ok=True)
             self.pixiv_utils.download_image = original_download
             self.pixiv_utils._build_image_from_bytes = original_build
+
+    async def test_component_construction_failure_cleans_its_written_temp_files(self):
+        self.pixiv_utils._config.image_send_method = "file"
+        original_from_file = FakeImage.__dict__["fromFileSystem"]
+        original_download = self.pixiv_utils.download_image
+
+        def fail_from_file_system(path, **kwargs):
+            raise RuntimeError("component construction failed")
+
+        async def successful_download(session, url, headers=None):
+            return b"image-bytes"
+
+        FakeImage.fromFileSystem = staticmethod(fail_from_file_system)
+        self.pixiv_utils.download_image = successful_download
+        try:
+            results = await self._collect_delivery(fake_illust(1))
+        finally:
+            FakeImage.fromFileSystem = original_from_file
+            self.pixiv_utils.download_image = original_download
+
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakePlain)
+        self.assertEqual(list(self.temp_dir.glob("pixiv_*")), [])
+
+    async def test_partial_file_write_failure_cleans_its_temp_files(self):
+        self.pixiv_utils._config.image_send_method = "file"
+        original_open = self.pixiv_utils.aiofiles.open
+        original_download = self.pixiv_utils.download_image
+
+        class PartialWriteFile:
+            def __init__(self, path, mode):
+                self.file = open(path, mode)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                self.file.close()
+
+            async def write(self, data):
+                self.file.write(data[:1])
+                self.file.flush()
+                raise OSError("partial write failed")
+
+        def partial_write_open(path, mode, **kwargs):
+            return PartialWriteFile(path, mode)
+
+        async def successful_download(session, url, headers=None):
+            return b"image-bytes"
+
+        self.pixiv_utils.aiofiles.open = partial_write_open
+        self.pixiv_utils.download_image = successful_download
+        try:
+            results = await self._collect_delivery(fake_illust(1))
+        finally:
+            self.pixiv_utils.aiofiles.open = original_open
+            self.pixiv_utils.download_image = original_download
+
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakePlain)
+        self.assertEqual(list(self.temp_dir.glob("pixiv_*")), [])
 
 
 if __name__ == "__main__":

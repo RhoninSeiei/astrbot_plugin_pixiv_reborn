@@ -106,19 +106,26 @@ class PixivTempCleanupTest(unittest.IsolatedAsyncioTestCase):
         install_import_stubs()
         from utils import pixiv_utils
 
-        pixiv_utils._temp_dir = Path(__file__).resolve().parents[1] / ".tmp"
-        pixiv_utils._config = types.SimpleNamespace(
-            image_send_method="file",
-            pil_compress_quality=100,
-            pil_compress_target_kb=0,
-        )
+        temp_parent = Path(__file__).resolve().parents[1] / ".tmp"
+        created_temp_parent = not temp_parent.exists()
+        temp_parent.mkdir(exist_ok=True)
+        try:
+            pixiv_utils._temp_dir = temp_parent
+            pixiv_utils._config = types.SimpleNamespace(
+                image_send_method="file",
+                pil_compress_quality=100,
+                pil_compress_target_kb=0,
+            )
 
-        image = await pixiv_utils._build_image_from_bytes(b"image-bytes")
-        self.assertTrue(Path(image.path).exists())
+            image = await pixiv_utils._build_image_from_bytes(b"image-bytes")
+            self.assertTrue(Path(image.path).exists())
 
-        await pixiv_utils.cleanup_pixiv_temp_files(FakeMessageChain([image]))
+            await pixiv_utils.cleanup_pixiv_temp_files(FakeMessageChain([image]))
 
-        self.assertFalse(Path(image.path).exists())
+            self.assertFalse(Path(image.path).exists())
+        finally:
+            if created_temp_parent:
+                temp_parent.rmdir()
 
 
 if __name__ == "__main__":

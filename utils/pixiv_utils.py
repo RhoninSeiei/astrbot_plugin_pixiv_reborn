@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import aiofiles
+from contextlib import AsyncExitStack
 import io
 import shutil
 import subprocess
@@ -164,37 +165,43 @@ def _build_image_from_url(url: str) -> Optional[Image]:
     return None
 
 
+class _SinglePageUrls:
+    def __init__(self, illust):
+        self.original = getattr(
+            getattr(illust, "meta_single_page", None), "original_image_url", None
+        )
+        self.large = getattr(getattr(illust, "image_urls", None), "large", None)
+        self.medium = getattr(getattr(illust, "image_urls", None), "medium", None)
+
+
+def _get_illust_url_sources(illust):
+    page_count = max(1, int(getattr(illust, "page_count", 1) or 1))
+    if page_count > 1:
+        return [
+            page.image_urls
+            for page in list(getattr(illust, "meta_pages", []) or [])[:page_count]
+            if getattr(page, "image_urls", None) is not None
+        ]
+    return [_SinglePageUrls(illust)]
+
+
 def get_illust_delivery_image_count(illust, send_all_pages: bool) -> int:
     if getattr(illust, "type", None) == "ugoira":
         return 1
+
+    available_count = len(_get_illust_url_sources(illust))
     if not send_all_pages:
-        return 1
+        return min(1, available_count)
+
     page_count = max(1, int(getattr(illust, "page_count", 1) or 1))
-    return page_count if page_count <= MULTI_PAGE_FULL_LIMIT else MULTI_PAGE_OVERFLOW_COUNT
+    requested_count = (
+        page_count if page_count <= MULTI_PAGE_FULL_LIMIT else MULTI_PAGE_OVERFLOW_COUNT
+    )
+    return min(requested_count, available_count)
 
 
 def _select_illust_url_sources(illust, selected_count: int):
-    if int(getattr(illust, "page_count", 1) or 1) > 1:
-        return [
-            getattr(page, "image_urls", None)
-            for page in list(getattr(illust, "meta_pages", []) or [])[:selected_count]
-        ]
-
-    class SinglePageUrls:
-        def __init__(self, source_illust):
-            self.original = getattr(
-                getattr(source_illust, "meta_single_page", None),
-                "original_image_url",
-                None,
-            )
-            self.large = getattr(
-                getattr(source_illust, "image_urls", None), "large", None
-            )
-            self.medium = getattr(
-                getattr(source_illust, "image_urls", None), "medium", None
-            )
-
-    return [SinglePageUrls(illust)]
+    return _get_illust_url_sources(illust)[:selected_count]
 
 
 async def _prepare_image_component(session: aiohttp.ClientSession, url_obj):
@@ -217,6 +224,8 @@ async def _prepare_image_component(session: aiohttp.ClientSession, url_obj):
                 if image_component:
                     return image_component
 
+            if session is None:
+                continue
             image_data = await download_image(session, image_url)
             if image_data:
                 return await _build_image_from_bytes(image_data)
@@ -431,10 +440,21 @@ async def _build_image_from_bytes(img_data: bytes, ext: str = ".jpg") -> Image:
         # 写入临时文件，通过文件路径发送
         file_name = f"pixiv_{uuid.uuid4().hex}{ext}"
         file_path = Path(_temp_dir) / file_name
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(img_data)
-        logger.debug(f"Pixiv 插件：使用文件路径发送图片 - {file_path}")
-        return Image.fromFileSystem(str(file_path))
+        try:
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(img_data)
+            logger.debug(f"Pixiv 插件：使用文件路径发送图片 - {file_path}")
+            return Image.fromFileSystem(str(file_path))
+        except Exception:
+            try:
+                await asyncio.to_thread(file_path.unlink)
+            except FileNotFoundError:
+                pass
+            except Exception as cleanup_error:
+                logger.warning(
+                    f"Pixiv 插件：清理失败图片临时文件失败 - {file_path}: {cleanup_error}"
+                )
+            raise
     else:
         # 直接使用 base64 发送
         return Image.fromBytes(img_data)
@@ -634,9 +654,16 @@ async def send_pixiv_image(
     selected_count = get_illust_delivery_image_count(illust, send_all_pages)
     selected_sources = _select_illust_url_sources(illust, selected_count)
     components = []
-    async with aiohttp.ClientSession() as session:
+    async with AsyncExitStack() as exit_stack:
+        session = None
         for url_obj in selected_sources:
-            component = await _prepare_image_component(session, url_obj)
+            component = await _prepare_image_component(None, url_obj)
+            if component is None:
+                if session is None:
+                    session = await exit_stack.enter_async_context(
+                        aiohttp.ClientSession()
+                    )
+                component = await _prepare_image_component(session, url_obj)
             if component is None:
                 await cleanup_pixiv_temp_files(components)
                 yield event.plain_result(
@@ -646,8 +673,13 @@ async def send_pixiv_image(
             components.append(component)
 
     details = detail_message or ""
-    if int(getattr(illust, "page_count", 1) or 1) >= 10:
-        details = f"{details}\n作品ID: {illust.id}".strip()
+    if send_all_pages and int(getattr(illust, "page_count", 1) or 1) > MULTI_PAGE_FULL_LIMIT:
+        work_id_line = f"作品ID: {illust.id}"
+        detail_lines = [
+            line for line in details.splitlines() if line.strip() != work_id_line
+        ]
+        details = "\n".join(detail_lines)
+        details = f"{details}\n{work_id_line}".strip()
     if show_details and details:
         components.append(Plain(details))
     yield event.chain_result(components)
