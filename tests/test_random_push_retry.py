@@ -2,6 +2,7 @@ import collections
 import sys
 import tempfile
 import types
+import typing
 import unittest
 from pathlib import Path
 
@@ -282,6 +283,17 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(config.excluded_tags, ["ntr", "悪堕ち"])
 
+    def test_random_retry_return_annotation_matches_delivery_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            hints = typing.get_type_hints(
+                random_search.RandomSearchService._send_random_illust_with_retry
+            )
+
+            self.assertIs(hints["return"], random_search.RandomIllustDeliveryResult)
+
     async def _run_with_patches(self, fail_ids, return_count):
         with tempfile.TemporaryDirectory() as temp_dir:
             install_import_stubs(temp_dir)
@@ -356,6 +368,7 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[2], 1)
         self.assertEqual(calls[3], 1)
         self.assertEqual(result.sent_count, 2)
+        self.assertEqual(result.sent_image_count, 2)
         self.assertEqual(len(service.context.sent_messages), 2)
         self.assertEqual(sent_records, [(2, "172448191"), (3, "172448191")])
         self.assertTrue(any(not item["success"] and item["illust_id"] == 1 for item in attempts))
@@ -377,6 +390,7 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[2], 3)
         self.assertEqual(calls[3], 0)
         self.assertEqual(result.sent_count, 0)
+        self.assertEqual(result.sent_image_count, 0)
         self.assertEqual(service.context.sent_messages, [])
         self.assertEqual(sent_records, [])
         self.assertEqual(

@@ -396,7 +396,7 @@ class RandomSearchService:
         source_name: str,
         illust,
         config: FilterConfig,
-    ) -> set[int]:
+    ) -> RandomIllustDeliveryResult:
         illust_id = self._get_illust_id(illust)
         related_ids = [illust_id] if illust_id is not None else []
         detail_message = build_detail_message(illust, is_novel=False)

@@ -56,7 +56,8 @@ class FakePlain:
 
 
 class FakeImage:
-    pass
+    def __init__(self, path=None):
+        self.path = path
 
 
 class FakeNode:
@@ -102,6 +103,11 @@ def load_subscription_module():
     pixiv_utils = types.ModuleType("task_two_subscription.utils.pixiv_utils")
     pixiv_utils.filter_items = lambda items, tag_label, excluded_tags=None: (items, [])
     pixiv_utils.send_pixiv_image = None
+
+    async def noop_cleanup(message_content):
+        return 0
+
+    pixiv_utils.cleanup_pixiv_temp_files = noop_cleanup
 
     database = types.ModuleType("task_two_subscription.utils.database")
     database.get_all_subscriptions = lambda: []
@@ -245,12 +251,14 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(updated_illust_ids, [])
 
-    async def test_artist_update_plain_atomic_failure_chain_keeps_cursor(self):
+    async def test_artist_update_plain_atomic_failure_is_silent_and_retried(self):
         subscription = load_subscription_module()
         sent_messages = []
+        send_attempts = []
         updated_illust_ids = []
 
         async def second_page_failure_chain(*args, **kwargs):
+            send_attempts.append(args[2].id)
             failure = FakeMessageChain()
             failure.chain = [FakePlain("page 2 delivery failed")]
             yield failure
@@ -289,16 +297,96 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
             )
 
             await service.check_artist_updates(sub)
+            await service.check_artist_updates(sub)
         finally:
             subscription.filter_items = original_filter_items
             subscription.send_pixiv_image = original_send_pixiv_image
             subscription.update_last_notified_id = original_update_last_notified_id
 
         self.assertEqual(updated_illust_ids, [])
-        self.assertEqual(len(sent_messages), 1)
-        self.assertEqual(
-            [component.text for component in sent_messages[0][1].chain],
-            ["page 2 delivery failed"],
+        self.assertEqual(send_attempts, [2, 2])
+        self.assertEqual(sent_messages, [])
+
+    async def _run_subscription_cleanup_case(self, *, force_forward, send_raises):
+        subscription = load_subscription_module()
+        temp_dir = Path(__file__).resolve().parents[1] / ".tmp"
+        temp_dir.mkdir(exist_ok=True)
+        paths = [
+            temp_dir / f"pixiv_subscription_{force_forward}_{send_raises}_{index}.jpg"
+            for index in range(2)
+        ]
+        for index, path in enumerate(paths):
+            path.write_bytes(f"image-{index}".encode())
+
+        atomic_chain = FakeMessageChain()
+        atomic_chain.chain = [
+            FakeImage(path=str(paths[0])),
+            FakeImage(path=str(paths[1])),
+            FakePlain("details"),
+        ]
+
+        async def atomic_multi_page_delivery(*args, **kwargs):
+            yield atomic_chain
+
+        async def cleanup_message_files(message_content):
+            removed = 0
+            for component in message_content.chain:
+                path = getattr(component, "path", None)
+                if path and Path(path).exists():
+                    Path(path).unlink()
+                    removed += 1
+            return removed
+
+        class FakeContext:
+            async def send_message(self, session_id, message):
+                if send_raises:
+                    raise RuntimeError("send failed")
+
+        original_send_pixiv_image = subscription.send_pixiv_image
+        had_cleanup = hasattr(subscription, "cleanup_pixiv_temp_files")
+        original_cleanup = getattr(subscription, "cleanup_pixiv_temp_files", None)
+        subscription.send_pixiv_image = atomic_multi_page_delivery
+        subscription.cleanup_pixiv_temp_files = cleanup_message_files
+        try:
+            service = object.__new__(subscription.SubscriptionService)
+            service.client = object()
+            service.context = FakeContext()
+            service.pixiv_config = types.SimpleNamespace(
+                show_details=True,
+                subscription_force_forward=force_forward,
+            )
+            sub = types.SimpleNamespace(
+                session_id="session", sub_type="artist", target_name="artist"
+            )
+
+            image_sent = await service.send_update(sub, FakeIllust(2))
+            self.assertEqual(image_sent, not send_raises)
+            self.assertTrue(all(not path.exists() for path in paths))
+        finally:
+            subscription.send_pixiv_image = original_send_pixiv_image
+            if had_cleanup:
+                subscription.cleanup_pixiv_temp_files = original_cleanup
+            else:
+                del subscription.cleanup_pixiv_temp_files
+            for path in paths:
+                path.unlink(missing_ok=True)
+
+    async def test_subscription_normal_send_cleans_atomic_chain_files(self):
+        await self._run_subscription_cleanup_case(
+            force_forward=False,
+            send_raises=False,
+        )
+
+    async def test_subscription_force_forward_cleans_original_atomic_chain_files(self):
+        await self._run_subscription_cleanup_case(
+            force_forward=True,
+            send_raises=False,
+        )
+
+    async def test_subscription_send_exception_cleans_atomic_chain_files(self):
+        await self._run_subscription_cleanup_case(
+            force_forward=False,
+            send_raises=True,
         )
 
     async def test_subscription_force_forward_wraps_atomic_chain_in_one_node(self):

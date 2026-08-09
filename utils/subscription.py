@@ -4,6 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api import logger
 from pixivpy3 import AppPixivAPI
 from ..utils.pixiv_utils import (
+    cleanup_pixiv_temp_files,
     filter_items,
     send_pixiv_image,
 )
@@ -106,7 +107,7 @@ class SubscriptionService:
         try:
             # 导入 MessageChain 类
             from astrbot.core.message.message_event_result import MessageChain
-            from astrbot.api.message_components import Image, Node, Nodes, Plain
+            from astrbot.api.message_components import Image, Node, Nodes
 
             # 创建模拟事件对象（用于捕获消息链）
             class MockEvent:
@@ -139,45 +140,27 @@ class SubscriptionService:
                 send_all_pages=True,
             ):
                 if message_content:
-                    if hasattr(message_content, "chain"):
+                    try:
+                        if not hasattr(message_content, "chain"):
+                            continue
+
+                        node_content = list(message_content.chain or [])
+                        if not any(
+                            isinstance(component, Image) for component in node_content
+                        ):
+                            continue
+
                         if self.pixiv_config.subscription_force_forward:
                             # 订阅消息统一以合并转发发送（即便只有一条），避免图片直接出现在群聊中
-                            node_content = list(message_content.chain or [])
                             forward_chain = mock_event.chain_result(
                                 [Nodes(nodes=[Node(name="Pixiv订阅", content=node_content)])]
                             )
                             await self.context.send_message(session_id_str, forward_chain)
                         else:
                             await self.context.send_message(session_id_str, message_content)
-                        # 只有包含 Image 组件时才视为图片发送成功（文本节点不推进游标）
-                        if any(
-                            isinstance(component, Image)
-                            for component in (message_content.chain or [])
-                        ):
-                            image_sent = True
-                    else:
-                        plain_text = str(message_content)
-                        if self.pixiv_config.subscription_force_forward:
-                            # 如果不是 MessageChain，对文本也走单节点合并消息
-                            forward_chain = mock_event.chain_result(
-                                [
-                                    Nodes(
-                                        nodes=[
-                                            Node(
-                                                name="Pixiv订阅",
-                                                content=[Plain(plain_text)],
-                                            )
-                                        ]
-                                    )
-                                ]
-                            )
-                            await self.context.send_message(session_id_str, forward_chain)
-                        else:
-                            message_chain = MessageChain()
-                            message_chain.message(plain_text)
-                            await self.context.send_message(
-                                session_id_str, message_chain
-                            )
+                        image_sent = True
+                    finally:
+                        await cleanup_pixiv_temp_files(message_content)
             return image_sent
 
         except Exception as e:

@@ -189,15 +189,13 @@ def get_illust_delivery_image_count(illust, send_all_pages: bool) -> int:
     if getattr(illust, "type", None) == "ugoira":
         return 1
 
-    available_count = len(_get_illust_url_sources(illust))
     if not send_all_pages:
-        return min(1, available_count)
+        return 1
 
     page_count = max(1, int(getattr(illust, "page_count", 1) or 1))
-    requested_count = (
+    return (
         page_count if page_count <= MULTI_PAGE_FULL_LIMIT else MULTI_PAGE_OVERFLOW_COUNT
     )
-    return min(requested_count, available_count)
 
 
 def _select_illust_url_sources(illust, selected_count: int):
@@ -653,6 +651,12 @@ async def send_pixiv_image(
 
     selected_count = get_illust_delivery_image_count(illust, send_all_pages)
     selected_sources = _select_illust_url_sources(illust, selected_count)
+    if len(selected_sources) != selected_count:
+        yield event.plain_result(
+            "图片下载失败，仅发送信息：\n" + (detail_message or "")
+        )
+        return
+
     components = []
     async with AsyncExitStack() as exit_stack:
         session = None

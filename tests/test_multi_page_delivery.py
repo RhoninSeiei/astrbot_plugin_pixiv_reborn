@@ -137,6 +137,17 @@ def fake_illust(page_count, illust_id=148023016, available_page_count=None):
     )
 
 
+def fake_ugoira(illust_id=148023016):
+    return types.SimpleNamespace(
+        id=illust_id,
+        type="ugoira",
+        title="animated work",
+        user=types.SimpleNamespace(name="artist"),
+        page_count=12,
+        meta_pages=[],
+    )
+
+
 def load_illust_handler_module():
     module_name = "task_five_handler.handlers.illust"
     package = types.ModuleType("task_five_handler")
@@ -241,6 +252,89 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
             self.pixiv_utils.get_illust_delivery_image_count(fake_illust(9), False), 1
         )
 
+    def test_ugoira_delivery_count_is_one(self):
+        self.assertEqual(
+            self.pixiv_utils.get_illust_delivery_image_count(fake_ugoira(), True), 1
+        )
+
+    async def test_ugoira_delegates_once_without_normal_page_selection(self):
+        calls = []
+        original_send_ugoira = self.pixiv_utils.send_ugoira
+        original_select = self.pixiv_utils._select_illust_url_sources
+
+        async def fake_send_ugoira(client, event, illust, detail_message, show_details=True):
+            calls.append((illust.id, detail_message, show_details))
+            yield event.chain_result([FakeImage(data=b"delegated")])
+
+        def fail_normal_page_selection(*args, **kwargs):
+            raise AssertionError("ugoira must not use normal page selection")
+
+        self.pixiv_utils.send_ugoira = fake_send_ugoira
+        self.pixiv_utils._select_illust_url_sources = fail_normal_page_selection
+        try:
+            results = await self._collect_delivery(fake_ugoira())
+        finally:
+            self.pixiv_utils.send_ugoira = original_send_ugoira
+            self.pixiv_utils._select_illust_url_sources = original_select
+
+        self.assertEqual(calls, [(148023016, "details", True)])
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0].chain[0], FakeImage)
+
+    async def test_ugoira_success_yields_one_gif_image_and_details(self):
+        original_process = self.pixiv_utils.process_ugoira_for_content
+        original_build = self.pixiv_utils._build_image_from_bytes
+        build_calls = []
+
+        async def successful_process(client, session, illust, detail_message=None):
+            return {"gif_data": b"GIF89a", "ugoira_info": "ugoira details"}
+
+        async def capture_build(data, ext=".jpg"):
+            build_calls.append((data, ext))
+            return FakeImage(data=data)
+
+        self.pixiv_utils.process_ugoira_for_content = successful_process
+        self.pixiv_utils._build_image_from_bytes = capture_build
+        try:
+            results = [
+                result
+                async for result in self.pixiv_utils.send_ugoira(
+                    object(), FakeEvent(), fake_ugoira(), "details"
+                )
+            ]
+        finally:
+            self.pixiv_utils.process_ugoira_for_content = original_process
+            self.pixiv_utils._build_image_from_bytes = original_build
+
+        self.assertEqual(build_calls, [(b"GIF89a", ".gif")])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            [type(component) for component in results[0].chain],
+            [FakeImage, FakePlain],
+        )
+        self.assertEqual(results[0].chain[1].text, "ugoira details")
+
+    async def test_ugoira_failure_yields_readable_failure_notice(self):
+        original_process = self.pixiv_utils.process_ugoira_for_content
+
+        async def failed_process(client, session, illust, detail_message=None):
+            return None
+
+        self.pixiv_utils.process_ugoira_for_content = failed_process
+        try:
+            results = [
+                result
+                async for result in self.pixiv_utils.send_ugoira(
+                    object(), FakeEvent(), fake_ugoira(), "details"
+                )
+            ]
+        finally:
+            self.pixiv_utils.process_ugoira_for_content = original_process
+
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakePlain)
+        self.assertEqual(results[0].text, "动图处理失败")
+
     async def test_nine_pages_yield_one_chain_with_all_images_and_details(self):
         results = await self._collect_delivery(fake_illust(9))
 
@@ -279,20 +373,27 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(details, ["details"])
 
-    async def test_available_meta_pages_limit_delivery_count_and_components(self):
+    async def test_missing_meta_page_fails_the_whole_delivery(self):
         illust = fake_illust(3, available_page_count=2)
-
-        self.assertEqual(
-            self.pixiv_utils.get_illust_delivery_image_count(illust, True), 2
-        )
         results = await self._collect_delivery(illust)
 
-        images = [component for component in results[0].chain if isinstance(component, FakeImage)]
-        self.assertEqual(len(images), 2)
         self.assertEqual(
-            [component.url for component in images],
-            ["https://example.test/0.jpg", "https://example.test/1.jpg"],
+            self.pixiv_utils.get_illust_delivery_image_count(illust, True), 3
         )
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakePlain)
+        self.assertIn("图片下载失败", results[0].text)
+
+    async def test_empty_meta_pages_fail_without_an_image_message(self):
+        illust = fake_illust(3, available_page_count=0)
+        results = await self._collect_delivery(illust)
+
+        self.assertEqual(
+            self.pixiv_utils.get_illust_delivery_image_count(illust, True), 3
+        )
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakePlain)
+        self.assertIn("图片下载失败", results[0].text)
 
     async def test_existing_work_id_is_not_duplicated_for_truncated_delivery(self):
         results = await self._collect_delivery(
