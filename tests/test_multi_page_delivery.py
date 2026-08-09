@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import sys
 import types
 import unittest
@@ -134,6 +135,47 @@ def fake_illust(page_count, illust_id=148023016, available_page_count=None):
             medium="https://example.test/single-medium.jpg",
         ),
     )
+
+
+def load_illust_handler_module():
+    module_name = "task_five_handler.handlers.illust"
+    package = types.ModuleType("task_five_handler")
+    package.__path__ = [str(Path(__file__).resolve().parents[1])]
+    handlers_package = types.ModuleType("task_five_handler.handlers")
+    handlers_package.__path__ = [str(Path(__file__).resolve().parents[1] / "handlers")]
+    utils_package = types.ModuleType("task_five_handler.utils")
+    utils_package.__path__ = [str(Path(__file__).resolve().parents[1] / "utils")]
+
+    astrbot_event = types.ModuleType("astrbot.api.event")
+    astrbot_event.AstrMessageEvent = object
+    tag = types.ModuleType("task_five_handler.utils.tag")
+    tag.build_detail_message = lambda illust, is_novel=False: "details"
+    tag.FilterConfig = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    tag.validate_and_process_tags = lambda tags: {"success": True}
+    tag.process_and_send_illusts = None
+    tag.filter_illusts_with_reason = lambda illusts, config: (illusts, [])
+    tag.process_and_send_illusts_sorted = None
+    pixiv_utils = types.ModuleType("task_five_handler.utils.pixiv_utils")
+    pixiv_utils.send_pixiv_image = None
+    pixiv_utils.send_forward_message = None
+    help_module = types.ModuleType("task_five_handler.utils.help")
+    help_module.get_help_message = lambda *args, **kwargs: "help"
+
+    sys.modules["astrbot.api.event"] = astrbot_event
+    sys.modules["task_five_handler"] = package
+    sys.modules["task_five_handler.handlers"] = handlers_package
+    sys.modules["task_five_handler.utils"] = utils_package
+    sys.modules["task_five_handler.utils.tag"] = tag
+    sys.modules["task_five_handler.utils.pixiv_utils"] = pixiv_utils
+    sys.modules["task_five_handler.utils.help"] = help_module
+    sys.modules.pop(module_name, None)
+
+    module_path = Path(__file__).resolve().parents[1] / "handlers" / "illust.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    handler = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = handler
+    spec.loader.exec_module(handler)
+    return handler
 
 
 class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
@@ -328,6 +370,51 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertIsInstance(results[0], FakePlain)
         self.assertEqual(list(self.temp_dir.glob("pixiv_*")), [])
+
+    async def test_specific_id_uses_atomic_sender_when_forwarding_is_enabled(self):
+        handler_module = load_illust_handler_module()
+        captured_kwargs = {}
+        forward_calls = []
+
+        async def fake_send_pixiv_image(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield args[1].plain_result("sent")
+
+        async def fail_send_forward_message(*args, **kwargs):
+            forward_calls.append((args, kwargs))
+            yield None
+
+        class FakeClientWrapper:
+            client_api = types.SimpleNamespace(illust_detail=object())
+
+            async def authenticate(self):
+                return True
+
+            async def call_pixiv_api(self, method, illust_id):
+                return types.SimpleNamespace(illust=fake_illust(2))
+
+        handler_module.send_pixiv_image = fake_send_pixiv_image
+        handler_module.send_forward_message = fail_send_forward_message
+        handler = handler_module.IllustHandler(
+            FakeClientWrapper(),
+            types.SimpleNamespace(
+                r18_mode="filter",
+                filter_r18g_only=False,
+                ai_filter_mode="show",
+                ai_detection_mode="field_or_tag",
+                return_count=1,
+                show_filter_result=False,
+                single_response_mode=False,
+                show_details=True,
+                forward_threshold=True,
+            ),
+        )
+
+        results = [result async for result in handler.pixiv_specific(FakeEvent(), "42")]
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(captured_kwargs["send_all_pages"])
+        self.assertEqual(forward_calls, [])
 
     async def test_partial_file_write_failure_cleans_its_temp_files(self):
         self.pixiv_utils._config.image_send_method = "file"

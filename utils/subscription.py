@@ -136,6 +136,7 @@ class SubscriptionService:
                 illust,
                 detail_message,
                 self.pixiv_config.show_details,
+                send_all_pages=True,
             ):
                 if message_content:
                     if hasattr(message_content, "chain"):

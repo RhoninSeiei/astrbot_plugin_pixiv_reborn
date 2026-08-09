@@ -42,10 +42,48 @@ class FakeClient:
         return types.SimpleNamespace(illusts=[FakeIllust(2)])
 
 
+class FakeMessageChain:
+    def __init__(self):
+        self.chain = []
+
+    def message(self, text):
+        self.chain.append(FakePlain(text))
+
+
+class FakePlain:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeImage:
+    pass
+
+
+class FakeNode:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class FakeNodes:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 def load_subscription_module():
     astrbot = types.ModuleType("astrbot")
     astrbot_api = types.ModuleType("astrbot.api")
     astrbot_api.logger = FakeLogger()
+    astrbot_core = types.ModuleType("astrbot.core")
+    astrbot_core_message = types.ModuleType("astrbot.core.message")
+    message_event_result = types.ModuleType(
+        "astrbot.core.message.message_event_result"
+    )
+    message_event_result.MessageChain = FakeMessageChain
+    message_components = types.ModuleType("astrbot.api.message_components")
+    message_components.Image = FakeImage
+    message_components.Node = FakeNode
+    message_components.Nodes = FakeNodes
+    message_components.Plain = FakePlain
 
     apscheduler = types.ModuleType("apscheduler")
     apscheduler_schedulers = types.ModuleType("apscheduler.schedulers")
@@ -74,6 +112,10 @@ def load_subscription_module():
 
     sys.modules.setdefault("astrbot", astrbot)
     sys.modules["astrbot.api"] = astrbot_api
+    sys.modules["astrbot.core"] = astrbot_core
+    sys.modules["astrbot.core.message"] = astrbot_core_message
+    sys.modules["astrbot.core.message.message_event_result"] = message_event_result
+    sys.modules["astrbot.api.message_components"] = message_components
     sys.modules["apscheduler"] = apscheduler
     sys.modules["apscheduler.schedulers"] = apscheduler_schedulers
     sys.modules["apscheduler.schedulers.asyncio"] = apscheduler_asyncio
@@ -94,6 +136,37 @@ def load_subscription_module():
 
 
 class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_send_update_requests_atomic_multi_page_delivery(self):
+        subscription = load_subscription_module()
+        captured_kwargs = {}
+
+        async def fake_send_pixiv_image(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield FakeMessageChain()
+
+        class FakeContext:
+            async def send_message(self, session_id, message):
+                pass
+
+        original_send_pixiv_image = subscription.send_pixiv_image
+        subscription.send_pixiv_image = fake_send_pixiv_image
+        try:
+            service = object.__new__(subscription.SubscriptionService)
+            service.client = object()
+            service.context = FakeContext()
+            service.pixiv_config = types.SimpleNamespace(
+                show_details=True, subscription_force_forward=False
+            )
+            sub = types.SimpleNamespace(
+                session_id="session", sub_type="artist", target_name="artist"
+            )
+
+            await service.send_update(sub, FakeIllust(2))
+        finally:
+            subscription.send_pixiv_image = original_send_pixiv_image
+
+        self.assertTrue(captured_kwargs["send_all_pages"])
+
     async def test_artist_updates_pass_automatic_exclusions_to_filtering(self):
         subscription = load_subscription_module()
 
@@ -135,6 +208,42 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured_excluded_tags, ["ntr", "悪堕ち"])
         self.assertEqual(updated_illust_ids, [2])
+
+    async def test_artist_update_send_failure_keeps_notification_cursor(self):
+        subscription = load_subscription_module()
+        updated_illust_ids = []
+
+        async def failed_send_update(sub, illust):
+            return False
+
+        original_filter_items = subscription.filter_items
+        original_update_last_notified_id = subscription.update_last_notified_id
+        try:
+            subscription.filter_items = lambda *args, **kwargs: ([FakeIllust(2)], [])
+            subscription.update_last_notified_id = (
+                lambda chat_id, sub_type, target_id, illust_id: updated_illust_ids.append(
+                    illust_id
+                )
+            )
+
+            service = object.__new__(subscription.SubscriptionService)
+            service.client = FakeClient()
+            service.send_update = failed_send_update
+            service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
+            sub = types.SimpleNamespace(
+                target_id="123",
+                target_name="artist",
+                last_notified_illust_id=1,
+                chat_id="456",
+                sub_type="artist",
+            )
+
+            await service.check_artist_updates(sub)
+        finally:
+            subscription.filter_items = original_filter_items
+            subscription.update_last_notified_id = original_update_last_notified_id
+
+        self.assertEqual(updated_illust_ids, [])
 
 
 if __name__ == "__main__":
