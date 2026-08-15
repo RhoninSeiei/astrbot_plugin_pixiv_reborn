@@ -287,6 +287,8 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("source_text", props)
         self.assertEqual(props["count"]["maximum"], 5)
         self.assertEqual(props["filters"]["default"], "safe")
+        self.assertIn("主 Pixiv tag", props["query"]["description"])
+        self.assertIn("仅用于诊断", props["source_text"]["description"])
 
     def test_factory_returns_native_tools_without_handlers(self):
         tools = self.llm_tool.create_pixiv_llm_tools()
@@ -308,6 +310,43 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tool.__module__, module_path)
             self.assertEqual(tool.handler_module_path, module_path)
             self.assertIsNone(tool.handler)
+
+    def test_query_builds_arbitrary_exact_tags_without_alias(self):
+        tool = self.llm_tool.PixivIllustSearchTool()
+
+        candidates = tool._build_search_candidates(
+            query="神崎蘭子 偶像大师灰姑娘女孩",
+            tags=[],
+            source_text="机器人发点神崎蘭子的图",
+        )
+
+        candidate_pairs = [
+            (item["word"], item["search_target"]) for item in candidates
+        ]
+        self.assertIn(
+            ("神崎蘭子", "exact_match_for_tags"), candidate_pairs
+        )
+        self.assertNotIn(
+            "神崎蘭子 偶像大师灰姑娘女孩 机器人 神崎蘭子",
+            [item["word"] for item in candidates],
+        )
+
+    def test_source_text_does_not_change_structured_query_candidates(self):
+        tool = self.llm_tool.PixivIllustSearchTool()
+
+        candidates = tool._build_search_candidates(
+            query="未知角色 未知作品",
+            tags=[],
+            source_text="机器人发点未知角色的图",
+        )
+
+        without_source = tool._build_search_candidates(
+            query="未知角色 未知作品",
+            tags=[],
+            source_text="完全不同的自然语言句式",
+        )
+
+        self.assertEqual(candidates, without_source)
 
     async def test_call_uses_candidate_tags_and_sends_images_in_event_context(self):
         from astrbot.core.agent.run_context import ContextWrapper
@@ -342,6 +381,48 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0][0], "Atlanta(艦隊これくしょん)")
         self.assertEqual([call[0] for call in wrapper.calls], ["search_illust"])
         self.assertEqual([item.illust_id for item in event.sent], [1, 2])
+
+    async def test_ranko_natural_request_searches_exact_character_tag(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        class RankoPixivClient(FakePixivClient):
+            def search_illust(self, word, **kwargs):
+                self.calls.append((word, kwargs))
+                if word == "神崎蘭子":
+                    return FakeSearchResult([FakeIllust(71)])
+                return FakeSearchResult([])
+
+        client = RankoPixivClient()
+        event = FakeEvent()
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=client,
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool.call(
+                ContextWrapper(FakeAgentContext(event)),
+                query="神崎蘭子 偶像大师灰姑娘女孩",
+                count=1,
+                filters="safe",
+                tags=[],
+                source_text="机器人发点神崎蘭子的图",
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual(
+            [word for word, _ in client.calls],
+            ["神崎蘭子 偶像大师灰姑娘女孩", "神崎蘭子"],
+        )
+        self.assertEqual([item.illust_id for item in event.sent], [71])
 
 
 class PixivV4273NativeToolTest(unittest.IsolatedAsyncioTestCase):

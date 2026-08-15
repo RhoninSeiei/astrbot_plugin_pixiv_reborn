@@ -85,6 +85,7 @@ PIXIV_QUERY_FILLERS = (
     "pixiv",
     "搜索",
     "搜",
+    "机器人",
     "的图",
     "的圖",
 )
@@ -101,7 +102,7 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     pixiv_client_wrapper: Any = None
     name: str = "pixiv_search_illust"
     description: str = (
-        "根据自然语言、作品名、角色名、Pixiv tag 或 tag 候选列表搜索 Pixiv 插画，"
+        "根据LLM提取的主搜索词、作品名、角色名、Pixiv tag 或 tag 候选列表搜索 Pixiv 插画，"
         "并在当前事件上下文中发送图片。工具内部会做 Pixiv tag 规范化、别名转换、"
         "常用日文标签补全、角色名与作品名组合搜索和失败降级。"
         "返回给 Agent 的文本只描述执行状态。"
@@ -112,7 +113,10 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "原始搜索词或自然语言请求，例如作品名、角色名、Pixiv tag 或群聊请求文本。",
+                    "description": (
+                        "LLM从请求中提取的主 Pixiv tag 或搜索词。优先只填写角色名或主 tag，"
+                        "例如“机器人发点神崎蘭子的图”应填写“神崎蘭子”；不要附加请求句式。"
+                    ),
                 },
                 "count": {
                     "type": "integer",
@@ -130,12 +134,15 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选，调用方提供的候选 Pixiv tag 列表。",
+                    "description": (
+                        "可选的 Pixiv tag 候选列表。能够识别精确 tag 时应填写，"
+                        "插件会依次校验和搜索。"
+                    ),
                     "default": [],
                 },
                 "source_text": {
                     "type": "string",
-                    "description": "可选，群聊原始请求文本，用于内部二次解析。",
+                    "description": "可选的群聊原始请求文本，仅用于诊断和结果说明。",
                     "default": "",
                 },
             },
@@ -244,16 +251,17 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     def _build_search_candidates(
         self, query: str, tags: list[str] | None = None, source_text: str = ""
     ) -> list[dict[str, str]]:
-        raw_text = " ".join(item for item in [query, source_text] if item).strip()
         normalized_tags = self._normalize_tags(tags or [])
-        alias_tags = self._extract_alias_tags(raw_text)
-        loose_query = self._clean_query_text(raw_text)
+        alias_tags = self._extract_alias_tags(query)
+        cleaned_query = self._clean_query_text(query)
+        loose_queries = self._dedupe([cleaned_query])
 
         known_tags = self._dedupe(normalized_tags + alias_tags)
         work_tags = [tag for tag in known_tags if tag in PIXIV_WORK_TAGS]
         character_tags = [tag for tag in known_tags if tag not in PIXIV_WORK_TAGS]
+        inferred_tags = self._dedupe([cleaned_query, *cleaned_query.split()])
 
-        exact_tags = character_tags + work_tags
+        exact_tags = self._dedupe(character_tags + inferred_tags + work_tags)
         candidates: list[dict[str, str]] = []
 
         for tag in exact_tags:
@@ -284,7 +292,7 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 }
             )
 
-        if loose_query:
+        for loose_query in loose_queries:
             candidates.append(
                 {
                     "word": loose_query,
