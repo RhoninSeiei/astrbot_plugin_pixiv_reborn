@@ -4,13 +4,12 @@ import hashlib
 import io
 import base64
 from pathlib import Path
-from types import SimpleNamespace
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 from fpdf import FPDF
 
 from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.api import logger
 
@@ -721,44 +720,5 @@ def create_pixiv_llm_tools(
             pixiv_client_wrapper=pixiv_client_wrapper,
         ),
     ]
-    tools = [_as_astrbot_function_tool(tool_impl) for tool_impl in tool_impls]
-    logger.info(f"已创建 {len(tools)} 个LLM工具")
-    return tools
-
-
-def ensure_identity_preserving_tool_manager(tool_manager) -> None:
-    """让当前 AstrBot Tool Manager 返回保持工具对象身份的完整 ToolSet。"""
-    if not tool_manager or getattr(
-        tool_manager, "_pixiv_identity_preserving_tool_set", False
-    ):
-        return
-
-    original_get_full_tool_set = tool_manager.get_full_tool_set
-
-    def get_full_tool_set():
-        tool_set = ToolSet()
-        object.__setattr__(tool_set, "tools", tool_manager.func_list.copy())
-        return tool_set
-
-    tool_manager._pixiv_original_get_full_tool_set = original_get_full_tool_set
-    tool_manager.get_full_tool_set = get_full_tool_set
-    tool_manager._pixiv_identity_preserving_tool_set = True
-
-
-def _as_astrbot_function_tool(tool_impl: FunctionTool) -> FunctionTool:
-    """返回 AstrBot 当前 ToolSet 能保持对象身份的基础 FunctionTool。"""
-
-    async def handler(event, **kwargs):
-        context = ContextWrapper(SimpleNamespace(event=event))
-        return await tool_impl.call(context, **kwargs)
-
-    handler.__name__ = tool_impl.name
-    tool = FunctionTool(
-        name=tool_impl.name,
-        description=tool_impl.description,
-        parameters=tool_impl.parameters,
-        handler=handler,
-    )
-    tool.call = tool_impl.call
-    tool._pixiv_impl = tool_impl
-    return tool
+    logger.info(f"已创建 {len(tool_impls)} 个LLM工具")
+    return tool_impls

@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WORKTREE_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = (
+    WORKTREE_ROOT.parent.parent.parent
+    if WORKTREE_ROOT.parent.name == ".worktrees"
+    else WORKTREE_ROOT.parent
+)
 ASTRBOT_ROOT = PROJECT_ROOT / "AstrBot"
 if str(ASTRBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_ROOT))
@@ -20,6 +25,12 @@ UTILS_MODULES_TO_RELOAD = (
     "utils.tag",
     "utils.pixiv_utils",
     "utils.random_empty_retry",
+)
+ASTRBOT_TEST_STUB_MODULES = (
+    "deprecated",
+    "jsonschema",
+    "mcp",
+    "mcp.types",
 )
 
 
@@ -45,6 +56,58 @@ def restore_utils_attrs(module_names):
             setattr(utils_module, attr_name, sys.modules[module_name])
         elif hasattr(utils_module, attr_name):
             delattr(utils_module, attr_name)
+
+
+def install_astrbot_import_stubs():
+    astrbot_module = types.ModuleType("astrbot")
+    astrbot_module.__path__ = [str(ASTRBOT_ROOT / "astrbot")]
+    core_module = types.ModuleType("astrbot.core")
+    core_module.__path__ = [str(ASTRBOT_ROOT / "astrbot" / "core")]
+    agent_module = types.ModuleType("astrbot.core.agent")
+    agent_module.__path__ = [str(ASTRBOT_ROOT / "astrbot" / "core" / "agent")]
+    message_module = types.ModuleType("astrbot.core.message")
+    message_module.__path__ = [str(ASTRBOT_ROOT / "astrbot" / "core" / "message")]
+    api_module = types.ModuleType("astrbot.api")
+    api_module.logger = types.SimpleNamespace()
+    agent_context_module = types.ModuleType("astrbot.core.astr_agent_context")
+    agent_context_module.AstrAgentContext = object
+    message_result_module = types.ModuleType(
+        "astrbot.core.message.message_event_result"
+    )
+    message_result_module.MessageEventResult = type("MessageEventResult", (), {})
+    jsonschema_module = types.ModuleType("jsonschema")
+    jsonschema_module.validate = lambda *args, **kwargs: None
+    jsonschema_module.Draft202012Validator = types.SimpleNamespace(META_SCHEMA={})
+    deprecated_module = types.ModuleType("deprecated")
+    deprecated_module.deprecated = lambda **kwargs: lambda func: func
+    mcp_module = types.ModuleType("mcp")
+    mcp_types_module = types.ModuleType("mcp.types")
+    mcp_types_module.CallToolResult = type("CallToolResult", (), {})
+    mcp_module.types = mcp_types_module
+    pixiv_utils_module = types.ModuleType("utils.pixiv_utils")
+
+    async def send_pixiv_image(*args, **kwargs):
+        return None
+
+    pixiv_utils_module.send_pixiv_image = send_pixiv_image
+    pixiv_utils_module.generate_safe_filename = lambda title, default_name: title
+
+    sys.modules.update(
+        {
+            "astrbot": astrbot_module,
+            "astrbot.core": core_module,
+            "astrbot.core.agent": agent_module,
+            "astrbot.core.message": message_module,
+            "astrbot.api": api_module,
+            "astrbot.core.astr_agent_context": agent_context_module,
+            "astrbot.core.message.message_event_result": message_result_module,
+            "deprecated": deprecated_module,
+            "jsonschema": jsonschema_module,
+            "mcp": mcp_module,
+            "mcp.types": mcp_types_module,
+            "utils.pixiv_utils": pixiv_utils_module,
+        }
+    )
 
 
 class FakeLogger:
@@ -144,15 +207,18 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
             if name == "astrbot"
             or name.startswith("astrbot.")
             or name in UTILS_MODULES_TO_RELOAD
+            or name in ASTRBOT_TEST_STUB_MODULES
         }
         for name in module_names:
             if (
                 name == "astrbot"
                 or name.startswith("astrbot.")
                 or name in UTILS_MODULES_TO_RELOAD
+                or name in ASTRBOT_TEST_STUB_MODULES
             ):
                 sys.modules.pop(name, None)
         clear_module_attrs(UTILS_MODULES_TO_RELOAD)
+        install_astrbot_import_stubs()
 
         from utils import llm_tool
 
@@ -165,6 +231,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
                 name == "astrbot"
                 or name.startswith("astrbot.")
                 or name in UTILS_MODULES_TO_RELOAD
+                or name in ASTRBOT_TEST_STUB_MODULES
             ):
                 sys.modules.pop(name, None)
         sys.modules.update(cls.saved_modules)
@@ -192,29 +259,72 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(props["count"]["maximum"], 5)
         self.assertEqual(props["filters"]["default"], "safe")
 
-    def test_registered_tool_object_identity_is_shared_across_llm_request(self):
-        from astrbot.core.platform.astr_message_event import AstrMessageEvent
-        from astrbot.core.provider.func_tool_manager import FunctionToolManager
+    async def test_registered_tools_remain_native_and_permission_proxy_delegates_call(
+        self,
+    ):
+        from astrbot.core.agent.tool import ToolSet
 
-        tools = self.llm_tool.create_pixiv_llm_tools(
-            pixiv_client=FakePixivClient(),
-            pixiv_config=FakePixivConfig(),
-            pixiv_client_wrapper=FakeClientWrapper(),
-        )
+        FunctionTool = self.llm_tool.FunctionTool
+
+        class PermissionGuardedToolV4273Stub(FunctionTool):
+            def __init__(self, tool, manager):
+                super().__init__(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                )
+                self._wrapped = tool
+                self._mgr = manager
+                self.active = getattr(tool, "active", True)
+                self.handler_module_path = getattr(tool, "handler_module_path", None)
+
+            async def call(self, context, **kwargs):
+                error = await self._mgr._check_tool_permission(self.name, context)
+                if error is not None:
+                    return error
+                if self._wrapped.handler is not None:
+                    return await self._wrapped.handler(context.context.event, **kwargs)
+                return await self._wrapped.call(context, **kwargs)
+
+        class FunctionToolManagerV4273Stub:
+            def __init__(self):
+                self.func_list = []
+                self.permission_error = None
+                self.permission_checks = []
+
+            async def _check_tool_permission(self, name, context):
+                self.permission_checks.append((name, context))
+                return self.permission_error
+
+            def get_full_tool_set(self):
+                tool_set = ToolSet()
+                for tool in self.func_list:
+                    tool_set.add_tool(PermissionGuardedToolV4273Stub(tool, self))
+                return tool_set
+
+        tools = self.llm_tool.create_pixiv_llm_tools()
         pixiv_tool = next(tool for tool in tools if tool.name == "pixiv_search_illust")
-        manager = FunctionToolManager()
+        manager = FunctionToolManagerV4273Stub()
         manager.func_list.extend(tools)
-        self.llm_tool.ensure_identity_preserving_tool_manager(manager)
         request_tool_set = manager.get_full_tool_set()
-        event = object.__new__(AstrMessageEvent)
-        req = event.request_llm(
-            prompt="pixiv tool request",
-            tool_set=request_tool_set,
-        )
+        guarded_tool = request_tool_set.get_tool("pixiv_search_illust")
+        request = types.SimpleNamespace(func_tool=request_tool_set)
+        run_context = self.llm_tool.ContextWrapper(FakeAgentContext(FakeEvent()))
 
-        self.assertIs(manager.get_func("pixiv_search_illust"), pixiv_tool)
-        self.assertIs(request_tool_set.get_tool("pixiv_search_illust"), pixiv_tool)
-        self.assertIs(req.func_tool.get_tool("pixiv_search_illust"), pixiv_tool)
+        result = await guarded_tool.call(run_context, query="test")
+        self.assertEqual(result, "错误: Pixiv客户端未初始化")
+        self.assertEqual(manager.permission_checks, [(pixiv_tool.name, run_context)])
+        self.assertIs(request.func_tool.get_tool(pixiv_tool.name), guarded_tool)
+        self.assertIs(guarded_tool._wrapped, pixiv_tool)
+        self.assertIsInstance(pixiv_tool, self.llm_tool.PixivIllustSearchTool)
+        self.assertIsNone(pixiv_tool.handler)
+
+        manager.permission_error = "permission denied"
+        self.assertEqual(
+            await guarded_tool.call(run_context, query="test"),
+            "permission denied",
+        )
+        self.assertEqual(len(manager.permission_checks), 2)
 
     def test_registered_tools_are_bound_to_plugin_main_module(self):
         tools = self.llm_tool.create_pixiv_llm_tools(
@@ -229,7 +339,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         for tool in tools:
             self.assertEqual(tool.__module__, module_path)
             self.assertEqual(tool.handler_module_path, module_path)
-            self.assertEqual(tool.handler.__module__, module_path)
+            self.assertIsNone(tool.handler)
 
     async def test_call_uses_candidate_tags_and_sends_images_in_event_context(self):
         from astrbot.core.agent.run_context import ContextWrapper

@@ -14,7 +14,6 @@ from .utils.help import init_help_manager, get_help_message
 from .utils.llm_tool import (
     bind_tools_to_plugin_module,
     create_pixiv_llm_tools,
-    ensure_identity_preserving_tool_manager,
 )
 from .utils.tag import set_filter_config_source
 
@@ -120,9 +119,6 @@ class PixivSearchPlugin(Star):
             bind_tools_to_plugin_module(self.llm_tools, __name__)
             self.context.add_llm_tools(*self.llm_tools)
             bind_tools_to_plugin_module(self.llm_tools, __name__)
-            ensure_identity_preserving_tool_manager(
-                self.context.get_llm_tool_manager()
-            )
             logger.info(
                 f"Pixiv 插件：已注册 {len(self.llm_tools)} 个LLM工具到AstrBot系统。"
             )
