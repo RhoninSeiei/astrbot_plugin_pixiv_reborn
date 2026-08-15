@@ -84,13 +84,6 @@ def install_astrbot_import_stubs():
     mcp_types_module = types.ModuleType("mcp.types")
     mcp_types_module.CallToolResult = type("CallToolResult", (), {})
     mcp_module.types = mcp_types_module
-    pixiv_utils_module = types.ModuleType("utils.pixiv_utils")
-
-    async def send_pixiv_image(*args, **kwargs):
-        return None
-
-    pixiv_utils_module.send_pixiv_image = send_pixiv_image
-    pixiv_utils_module.generate_safe_filename = lambda title, default_name: title
 
     sys.modules.update(
         {
@@ -105,9 +98,39 @@ def install_astrbot_import_stubs():
             "jsonschema": jsonschema_module,
             "mcp": mcp_module,
             "mcp.types": mcp_types_module,
-            "utils.pixiv_utils": pixiv_utils_module,
         }
     )
+
+
+def install_pixiv_utils_stub():
+    pixiv_utils_module = types.ModuleType("utils.pixiv_utils")
+
+    async def send_pixiv_image(*args, **kwargs):
+        return None
+
+    pixiv_utils_module.send_pixiv_image = send_pixiv_image
+    pixiv_utils_module.generate_safe_filename = lambda title, default_name: title
+    sys.modules["utils.pixiv_utils"] = pixiv_utils_module
+
+
+def load_v4273_runtime():
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+    from astrbot.core.provider.func_tool_manager import (
+        FunctionToolManager,
+        _PermissionGuardedTool,
+    )
+
+    return types.SimpleNamespace(
+        ContextWrapper=ContextWrapper,
+        FunctionToolExecutor=FunctionToolExecutor,
+        FunctionToolManager=FunctionToolManager,
+        PermissionGuardedTool=_PermissionGuardedTool,
+    )
+
+
+def is_astrbot_module(name):
+    return name == "astrbot" or name.startswith("astrbot.")
 
 
 class FakeLogger:
@@ -218,7 +241,12 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
             ):
                 sys.modules.pop(name, None)
         clear_module_attrs(UTILS_MODULES_TO_RELOAD)
-        install_astrbot_import_stubs()
+        try:
+            cls.v4273_runtime = load_v4273_runtime()
+        except (ImportError, AttributeError):
+            cls.v4273_runtime = None
+            install_astrbot_import_stubs()
+        install_pixiv_utils_stub()
 
         from utils import llm_tool
 
@@ -259,72 +287,11 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(props["count"]["maximum"], 5)
         self.assertEqual(props["filters"]["default"], "safe")
 
-    async def test_registered_tools_remain_native_and_permission_proxy_delegates_call(
-        self,
-    ):
-        from astrbot.core.agent.tool import ToolSet
-
-        FunctionTool = self.llm_tool.FunctionTool
-
-        class PermissionGuardedToolV4273Stub(FunctionTool):
-            def __init__(self, tool, manager):
-                super().__init__(
-                    name=tool.name,
-                    description=tool.description,
-                    parameters=tool.parameters,
-                )
-                self._wrapped = tool
-                self._mgr = manager
-                self.active = getattr(tool, "active", True)
-                self.handler_module_path = getattr(tool, "handler_module_path", None)
-
-            async def call(self, context, **kwargs):
-                error = await self._mgr._check_tool_permission(self.name, context)
-                if error is not None:
-                    return error
-                if self._wrapped.handler is not None:
-                    return await self._wrapped.handler(context.context.event, **kwargs)
-                return await self._wrapped.call(context, **kwargs)
-
-        class FunctionToolManagerV4273Stub:
-            def __init__(self):
-                self.func_list = []
-                self.permission_error = None
-                self.permission_checks = []
-
-            async def _check_tool_permission(self, name, context):
-                self.permission_checks.append((name, context))
-                return self.permission_error
-
-            def get_full_tool_set(self):
-                tool_set = ToolSet()
-                for tool in self.func_list:
-                    tool_set.add_tool(PermissionGuardedToolV4273Stub(tool, self))
-                return tool_set
-
+    def test_factory_returns_native_tools_without_handlers(self):
         tools = self.llm_tool.create_pixiv_llm_tools()
-        pixiv_tool = next(tool for tool in tools if tool.name == "pixiv_search_illust")
-        manager = FunctionToolManagerV4273Stub()
-        manager.func_list.extend(tools)
-        request_tool_set = manager.get_full_tool_set()
-        guarded_tool = request_tool_set.get_tool("pixiv_search_illust")
-        request = types.SimpleNamespace(func_tool=request_tool_set)
-        run_context = self.llm_tool.ContextWrapper(FakeAgentContext(FakeEvent()))
-
-        result = await guarded_tool.call(run_context, query="test")
-        self.assertEqual(result, "错误: Pixiv客户端未初始化")
-        self.assertEqual(manager.permission_checks, [(pixiv_tool.name, run_context)])
-        self.assertIs(request.func_tool.get_tool(pixiv_tool.name), guarded_tool)
-        self.assertIs(guarded_tool._wrapped, pixiv_tool)
-        self.assertIsInstance(pixiv_tool, self.llm_tool.PixivIllustSearchTool)
-        self.assertIsNone(pixiv_tool.handler)
-
-        manager.permission_error = "permission denied"
-        self.assertEqual(
-            await guarded_tool.call(run_context, query="test"),
-            "permission denied",
-        )
-        self.assertEqual(len(manager.permission_checks), 2)
+        self.assertIsInstance(tools[0], self.llm_tool.PixivIllustSearchTool)
+        self.assertIsInstance(tools[1], self.llm_tool.PixivNovelSearchTool)
+        self.assertTrue(all(tool.handler is None for tool in tools))
 
     def test_registered_tools_are_bound_to_plugin_main_module(self):
         tools = self.llm_tool.create_pixiv_llm_tools(
@@ -374,6 +341,183 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0][0], "Atlanta(艦隊これくしょん)")
         self.assertEqual([call[0] for call in wrapper.calls], ["search_illust"])
         self.assertEqual([item.illust_id for item in event.sent], [1, 2])
+
+
+class PixivV4273NativeToolTest(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        module_names = list(sys.modules)
+        cls.saved_astrbot_modules = {
+            name: sys.modules[name] for name in module_names if is_astrbot_module(name)
+        }
+        for name in module_names:
+            if is_astrbot_module(name):
+                sys.modules.pop(name, None)
+
+        try:
+            v4273_runtime = load_v4273_runtime()
+        except (ImportError, AttributeError) as exc:
+            cls.runtime = None
+            cls.skip_reason = f"AstrBot v4.27.3 runtime unavailable: {exc}"
+            return
+
+        module_names = list(sys.modules)
+        cls.saved_utils_modules = {
+            name: sys.modules[name]
+            for name in module_names
+            if name in UTILS_MODULES_TO_RELOAD
+        }
+        for name in module_names:
+            if name in UTILS_MODULES_TO_RELOAD:
+                sys.modules.pop(name, None)
+        clear_module_attrs(UTILS_MODULES_TO_RELOAD)
+        install_pixiv_utils_stub()
+
+        from utils import llm_tool
+
+        v4273_runtime.llm_tool = llm_tool
+        cls.runtime = v4273_runtime
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.runtime is None:
+            sys.modules.update(cls.saved_astrbot_modules)
+            return
+        for name in list(sys.modules):
+            if name in UTILS_MODULES_TO_RELOAD:
+                sys.modules.pop(name, None)
+        sys.modules.update(cls.saved_utils_modules)
+        for name in list(sys.modules):
+            if is_astrbot_module(name):
+                sys.modules.pop(name, None)
+        sys.modules.update(cls.saved_astrbot_modules)
+        restore_utils_attrs(UTILS_MODULES_TO_RELOAD)
+
+    def setUp(self):
+        if self.runtime is None:
+            self.skipTest(self.skip_reason)
+        self.llm_tool = self.runtime.llm_tool
+        self.original_logger = self.llm_tool.logger
+        self.llm_tool.logger = FakeLogger()
+
+    def tearDown(self):
+        if self.runtime is not None:
+            self.llm_tool.logger = self.original_logger
+
+    async def _execute(self, tool, context, **tool_args):
+        return [
+            result
+            async for result in self.runtime.FunctionToolExecutor._execute_local(
+                tool,
+                context,
+                **tool_args,
+            )
+        ]
+
+    def _install_permission_check(self, manager):
+        state = types.SimpleNamespace(error=None, calls=[])
+
+        async def check_permission(name, context):
+            state.calls.append((name, context))
+            return state.error
+
+        manager._check_tool_permission = check_permission
+        return state
+
+    async def test_illust_proxy_executes_native_call_with_context_and_permission(self):
+        tools = self.llm_tool.create_pixiv_llm_tools()
+        native_tool = next(tool for tool in tools if tool.name == "pixiv_search_illust")
+        manager = self.runtime.FunctionToolManager()
+        permission = self._install_permission_check(manager)
+        manager.func_list.extend(tools)
+        proxy = manager.get_full_tool_set().get_tool(native_tool.name)
+        context = self.runtime.ContextWrapper(FakeAgentContext(FakeEvent()))
+        original_call = native_tool.call
+        received_contexts = []
+
+        async def record_call(call_context, **kwargs):
+            received_contexts.append((call_context, kwargs))
+            return await original_call(call_context, **kwargs)
+
+        object.__setattr__(native_tool, "call", record_call)
+        results = await self._execute(proxy, context, query="test")
+
+        self.assertIs(manager.func_list[0], native_tool)
+        self.assertIsInstance(proxy, self.runtime.PermissionGuardedTool)
+        self.assertIs(proxy._wrapped, native_tool)
+        self.assertIsNone(native_tool.handler)
+        self.assertIsNone(proxy.handler)
+        self.assertEqual(results[0].content[0].text, "错误: Pixiv客户端未初始化")
+        self.assertEqual(received_contexts, [(context, {"query": "test"})])
+        self.assertEqual(permission.calls, [(native_tool.name, context)])
+
+        permission.error = "permission denied"
+        denied_results = await self._execute(proxy, context, query="test")
+
+        self.assertEqual(denied_results[0].content[0].text, "permission denied")
+        self.assertEqual(len(received_contexts), 1)
+
+    async def test_novel_proxy_forwards_keyword_and_id_with_event_and_missing_event(self):
+        class NovelClient:
+            def __init__(self):
+                self.calls = []
+                self.novel = types.SimpleNamespace(
+                    id=42,
+                    title="novel-title",
+                    user=FakeUser(),
+                )
+
+            def search_novel(self, query, **kwargs):
+                self.calls.append(("search_novel", query, kwargs))
+                return types.SimpleNamespace(novels=[self.novel])
+
+            def novel_detail(self, novel_id):
+                self.calls.append(("novel_detail", novel_id, {}))
+                return types.SimpleNamespace(novel=self.novel)
+
+        client = NovelClient()
+        tools = self.llm_tool.create_pixiv_llm_tools(pixiv_client=client)
+        native_tool = next(tool for tool in tools if tool.name == "pixiv_search_novel")
+        manager = self.runtime.FunctionToolManager()
+        self._install_permission_check(manager)
+        manager.func_list.extend(tools)
+        proxy = manager.get_full_tool_set().get_tool(native_tool.name)
+        event = FakeEvent()
+        context = self.runtime.ContextWrapper(FakeAgentContext(event))
+        received_contexts = []
+        original_call = native_tool.call
+
+        async def record_call(call_context, **kwargs):
+            received_contexts.append((call_context, kwargs))
+            return await original_call(call_context, **kwargs)
+
+        async def send_novel_result(received_event, items, query, tags):
+            self.assertIs(received_event, event)
+            self.assertEqual(items, [client.novel])
+            return f"event result for {query}"
+
+        object.__setattr__(native_tool, "call", record_call)
+        native_tool._send_novel_result = send_novel_result
+        keyword_results = await self._execute(proxy, context, query="keyword")
+        missing_event_context = self.runtime.ContextWrapper(FakeAgentContext(None))
+        missing_event_result = await proxy.call(missing_event_context, query="42")
+
+        self.assertEqual(keyword_results[0].content[0].text, "event result for keyword")
+        self.assertEqual(
+            missing_event_result,
+            "找到小说: novel-title (ID: 42)，但无法发送文件(无事件上下文)。",
+        )
+        self.assertEqual(
+            received_contexts,
+            [(context, {"query": "keyword"}), (missing_event_context, {"query": "42"})],
+        )
+        self.assertEqual(
+            client.calls,
+            [
+                ("search_novel", "keyword", {"search_target": "partial_match_for_tags"}),
+                ("novel_detail", 42, {}),
+            ],
+        )
 
 
 if __name__ == "__main__":
