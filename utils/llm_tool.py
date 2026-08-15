@@ -23,7 +23,11 @@ from .pixiv_utils import (
     send_pixiv_image,
     generate_safe_filename,
 )
-from .random_empty_retry import is_random_push_image_failure_notice
+from .random_empty_retry import (
+    is_random_push_image_failure_notice,
+    is_send_timeout_after_accept,
+)
+from .group_send_lock import get_group_send_lock
 
 
 async def _call_pixiv_api(pixiv_client_wrapper, func, *args, **kwargs):
@@ -285,8 +289,29 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     async def _search_illust(
         self, candidates, query, context, count=1, filters: str = "safe"
     ):
+        event = self._get_event(context)
+        chat_id = self._get_group_chat_id(event)
+        if not chat_id:
+            return await self._search_illust_unlocked(
+                candidates, query, context, count, filters
+            )
+
+        lock = self._get_group_lock(chat_id)
+        async with lock:
+            return await self._search_illust_unlocked(
+                candidates, query, context, count, filters
+            )
+
+    async def _search_illust_unlocked(
+        self, candidates, query, context, count=1, filters: str = "safe"
+    ):
         """按候选 tag 逐级搜索插画。"""
-        import asyncio
+        event = self._get_event(context)
+        chat_id = self._get_group_chat_id(event)
+        retention_days = self._sent_retention_days()
+        initial_pages = 3
+        max_pages = 10
+        filter_config = self._build_filter_config(query, count, filters)
 
         for candidate in candidates:
             tag_result = validate_and_process_tags(candidate["word"])
@@ -299,11 +324,11 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             search_word = tag_result["search_tags"]
             search_target = candidate["search_target"]
             all_illusts = []
+            seen_illust_ids = set()
             page_count = 0
             next_params = None
-            pages_to_fetch = 3
 
-            while page_count < pages_to_fetch:
+            while page_count < max_pages:
                 try:
                     if page_count == 0:
                         search_result = await _call_pixiv_api(
@@ -327,7 +352,13 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                         break
 
                     if search_result.illusts:
-                        all_illusts.extend(search_result.illusts)
+                        for illust in search_result.illusts:
+                            illust_id = getattr(illust, "id", None)
+                            if illust_id is not None and illust_id in seen_illust_ids:
+                                continue
+                            if illust_id is not None:
+                                seen_illust_ids.add(illust_id)
+                            all_illusts.append(illust)
                         page_count += 1
                     else:
                         break
@@ -336,6 +367,21 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                         next_params = self.pixiv_client.parse_qs(search_result.next_url)
                     else:
                         break
+
+                    if page_count >= initial_pages:
+                        if not chat_id:
+                            break
+                        unsent, _ = await self._partition_cached_illusts(
+                            all_illusts,
+                            chat_id,
+                            retention_days,
+                        )
+                        sendable_unsent, _ = filter_illusts_with_reason(
+                            unsent,
+                            filter_config,
+                        )
+                        if len(sendable_unsent) >= count:
+                            break
 
                     await asyncio.sleep(0.2)
                 except Exception as e:
@@ -354,22 +400,130 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 key=lambda x: getattr(x, "total_bookmarks", 0),
                 reverse=True,
             )
-            event = self._get_event(context)
+            selected_illusts = sorted_illusts
+            if chat_id:
+                unsent, recent = await self._partition_cached_illusts(
+                    sorted_illusts,
+                    chat_id,
+                    retention_days,
+                )
+                sendable_unsent, _ = filter_illusts_with_reason(
+                    unsent,
+                    filter_config,
+                )
+                sendable_recent, _ = filter_illusts_with_reason(
+                    recent,
+                    filter_config,
+                )
+                if sendable_unsent:
+                    selected_illusts = sendable_unsent
+                elif sendable_recent:
+                    selected_illusts = sendable_recent
+                    logger.info(
+                        "pixiv_search_illust 候选 %r 在 %s 天内均已发送，"
+                        "按最早发送时间回退。",
+                        search_word,
+                        retention_days,
+                    )
+                else:
+                    logger.info(
+                        "pixiv_search_illust 候选 %r 经内容和发送缓存过滤后无可发送作品",
+                        search_word,
+                    )
+                    continue
+            else:
+                selected_illusts, _ = filter_illusts_with_reason(
+                    selected_illusts,
+                    filter_config,
+                )
+                if not selected_illusts:
+                    continue
+
             return await self._send_pixiv_result(
-                event, sorted_illusts, query, search_word, count, filters
+                event,
+                selected_illusts,
+                query,
+                search_word,
+                count,
+                filters,
+                chat_id=chat_id,
+                filter_config=filter_config,
             )
 
         return "未找到可发送图片"
 
     async def _send_pixiv_result(
-        self, event, items, query, tags, count=1, filters: str = "safe"
+        self,
+        event,
+        items,
+        query,
+        tags,
+        count=1,
+        filters: str = "safe",
+        chat_id: str | None = None,
+        filter_config: FilterConfig | None = None,
     ):
         """发送按热度排序的结果，并只返回执行状态。"""
         logger.info(f"PixivIllustSearchTool: 准备发送 {count} 张图片")
         if not event or not hasattr(event, "send"):
             return "未找到当前事件上下文，无法发送图片"
 
-        config = FilterConfig(
+        config = filter_config or self._build_filter_config(query, count, filters)
+
+        filtered_items, _ = filter_illusts_with_reason(items, config)
+        filtered_items = self._dedupe_illusts(filtered_items)
+        if not filtered_items:
+            return "未找到可发送图片"
+
+        sent_count = 0
+        for illust in filtered_items:
+            if sent_count >= config.return_count:
+                break
+            try:
+                detail_message = build_detail_message(illust, is_novel=False)
+                async for result in send_pixiv_image(
+                    self.pixiv_client,
+                    event,
+                    illust,
+                    detail_message,
+                    show_details=config.show_details,
+                ):
+                    if is_random_push_image_failure_notice(result):
+                        logger.warning(
+                            f"pixiv_search_illust 跳过图片下载失败结果: {getattr(illust, 'id', 'unknown')}"
+                        )
+                        continue
+                    try:
+                        await event.send(result)
+                    except Exception as e:
+                        if not is_send_timeout_after_accept(e):
+                            raise
+                        logger.warning(
+                            "pixiv_search_illust 作品 %s 的发送回执超时，"
+                            "服务端已经受理，按发送成功处理。",
+                            getattr(illust, "id", "unknown"),
+                        )
+                    if chat_id:
+                        await self._record_sent_illust(illust.id, chat_id)
+                    sent_count += 1
+                    break
+            except Exception as e:
+                logger.warning(
+                    f"pixiv_search_illust 发送作品 {getattr(illust, 'id', 'unknown')} 失败: {e}"
+                )
+                continue
+
+        if sent_count > 0:
+            return f"已发送 {sent_count} 张图片"
+        return "未找到可发送图片"
+
+    def _build_filter_config(
+        self,
+        query: str,
+        count: int,
+        filters: str,
+    ) -> FilterConfig:
+        return FilterConfig(
             r18_mode="仅 R18" if filters == "r18" else "过滤 R18",
             filter_r18g_only=self.pixiv_config.filter_r18g_only
             if self.pixiv_config
@@ -394,40 +548,70 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             show_details=self.pixiv_config.show_details if self.pixiv_config else True,
         )
 
-        filtered_items, _ = filter_illusts_with_reason(items, config)
-        if not filtered_items:
-            return "未找到可发送图片"
-
-        sent_count = 0
-        for illust in filtered_items:
-            if sent_count >= config.return_count:
-                break
-            try:
-                detail_message = build_detail_message(illust, is_novel=False)
-                async for result in send_pixiv_image(
-                    self.pixiv_client,
-                    event,
-                    illust,
-                    detail_message,
-                    show_details=config.show_details,
-                ):
-                    if is_random_push_image_failure_notice(result):
-                        logger.warning(
-                            f"pixiv_search_illust 跳过图片下载失败结果: {getattr(illust, 'id', 'unknown')}"
-                        )
-                        continue
-                    await event.send(result)
-                    sent_count += 1
-                    break
-            except Exception as e:
-                logger.warning(
-                    f"pixiv_search_illust 发送作品 {getattr(illust, 'id', 'unknown')} 失败: {e}"
-                )
+    def _dedupe_illusts(self, illusts) -> list:
+        result = []
+        seen_ids = set()
+        for illust in illusts:
+            illust_id = getattr(illust, "id", None)
+            if illust_id is not None and illust_id in seen_ids:
                 continue
+            if illust_id is not None:
+                seen_ids.add(illust_id)
+            result.append(illust)
+        return result
 
-        if sent_count > 0:
-            return f"已发送 {sent_count} 张图片"
-        return "未找到可发送图片"
+    def _sent_retention_days(self) -> int:
+        value = getattr(
+            self.pixiv_config,
+            "llm_tool_sent_illust_retention_days",
+            45,
+        )
+        try:
+            return min(max(int(value), 1), 365)
+        except (TypeError, ValueError):
+            return 45
+
+    def _get_group_chat_id(self, event) -> str | None:
+        if not event:
+            return None
+        try:
+            group_id = event.get_group_id()
+            if group_id:
+                return str(group_id)
+        except Exception:
+            pass
+
+        try:
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            marker = ":GroupMessage:"
+            if marker in umo:
+                return umo.rsplit(marker, 1)[1] or None
+        except Exception:
+            pass
+        return None
+
+    def _get_group_lock(self, chat_id: str) -> asyncio.Lock:
+        return get_group_send_lock(chat_id)
+
+    async def _partition_cached_illusts(
+        self,
+        illusts,
+        chat_id: str,
+        retention_days: int,
+    ) -> tuple[list, list]:
+        from .database import partition_sent_illusts
+
+        return await asyncio.to_thread(
+            partition_sent_illusts,
+            illusts,
+            chat_id,
+            retention_days,
+        )
+
+    async def _record_sent_illust(self, illust_id: int, chat_id: str) -> None:
+        from .database import add_sent_illust
+
+        await asyncio.to_thread(add_sent_illust, illust_id, chat_id)
 
     def _get_event(self, context):
         try:

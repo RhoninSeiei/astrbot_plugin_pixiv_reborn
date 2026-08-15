@@ -2,6 +2,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -74,6 +75,76 @@ class DatabaseOptimizationTest(unittest.TestCase):
                 self.assertEqual(
                     indexes["idx_sentillust_chat_sent_at"], ("chat_id", "sent_at")
                 )
+            finally:
+                if not database.db.is_closed():
+                    database.db.close()
+
+    def test_partition_sent_illusts_is_group_scoped_and_expires_old_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = import_database_for_temp_dir(temp_dir)
+            try:
+                database.initialize_database()
+                now = datetime(2026, 8, 16, 12, 0, 0)
+                database.SentIllust.create(
+                    illust_id=1,
+                    chat_id="group-a",
+                    sent_at=now - timedelta(days=5),
+                )
+                database.SentIllust.create(
+                    illust_id=2,
+                    chat_id="group-a",
+                    sent_at=now - timedelta(days=40),
+                )
+                database.SentIllust.create(
+                    illust_id=3,
+                    chat_id="group-a",
+                    sent_at=now - timedelta(days=46),
+                )
+                database.SentIllust.create(
+                    illust_id=5,
+                    chat_id="group-a",
+                    sent_at=now - timedelta(days=45),
+                )
+                items = [types.SimpleNamespace(id=item_id) for item_id in range(1, 6)]
+
+                unsent, recent = database.partition_sent_illusts(
+                    items,
+                    "group-a",
+                    retention_days=45,
+                    now=now,
+                )
+                other_group_unsent, other_group_recent = (
+                    database.partition_sent_illusts(
+                        items,
+                        "group-b",
+                        retention_days=45,
+                        now=now,
+                    )
+                )
+
+                self.assertEqual([item.id for item in unsent], [3, 4])
+                self.assertEqual([item.id for item in recent], [5, 2, 1])
+                self.assertEqual(
+                    [item.id for item in other_group_unsent], [1, 2, 3, 4, 5]
+                )
+                self.assertEqual(other_group_recent, [])
+            finally:
+                if not database.db.is_closed():
+                    database.db.close()
+
+    def test_add_sent_illust_refreshes_existing_record_timestamp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = import_database_for_temp_dir(temp_dir)
+            try:
+                database.initialize_database()
+                old_time = datetime(2026, 6, 1, 12, 0, 0)
+                new_time = datetime(2026, 8, 16, 12, 0, 0)
+
+                database.add_sent_illust(71, "group-a", sent_at=old_time)
+                database.add_sent_illust(71, "group-a", sent_at=new_time)
+
+                record = database.SentIllust.get_by_id((71, "group-a"))
+                self.assertEqual(record.sent_at, new_time)
             finally:
                 if not database.db.is_closed():
                     database.db.close()

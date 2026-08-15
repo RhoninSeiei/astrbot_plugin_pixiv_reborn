@@ -169,6 +169,9 @@ class PixivConfig:
         self.random_sent_illust_retention_days = self.config.get(
             "random_sent_illust_retention_days", 7
         )
+        self.llm_tool_sent_illust_retention_days = self.config.get(
+            "llm_tool_sent_illust_retention_days", 45
+        )
         self.fanbox_sessid = self.config.get("fanbox_sessid", "").strip()
         self.fanbox_cookie = self.config.get("fanbox_cookie", "").strip()
         self.fanbox_user_agent = self.config.get("fanbox_user_agent", "").strip()
@@ -222,6 +225,7 @@ class PixivConfig:
             f"random_search_empty_retry_extra_depth={self.random_search_empty_retry_extra_depth}, "
             f"random_search_empty_retry_sources={self.random_search_empty_retry_sources}, "
             f"random_search_max_concurrent_jobs={self.random_search_max_concurrent_jobs}, "
+            f"llm_tool_sent_illust_retention_days={self.llm_tool_sent_illust_retention_days}, "
             f"fanbox_sessid={'已设置' if self.fanbox_sessid else '未设置'}, "
             f"fanbox_cookie={'已设置' if self.fanbox_cookie else '未设置'}, "
             f"fanbox_user_agent={'已设置' if self.fanbox_user_agent else '未设置'}, "
@@ -333,6 +337,11 @@ class PixivConfigManager:
             "fanbox_sessid": {"type": "string", "hidden": True},
             "fanbox_cookie": {"type": "string", "hidden": True},
             "random_sent_illust_retention_days": {"type": "int", "min": 1, "max": 365},
+            "llm_tool_sent_illust_retention_days": {
+                "type": "int",
+                "min": 1,
+                "max": 365,
+            },
         }
 
     def get_help_text(self) -> str:
@@ -383,6 +392,7 @@ class PixivConfigManager:
             "random_search_empty_retry_sources",
             "random_search_max_concurrent_jobs",
             "random_sent_illust_retention_days",
+            "llm_tool_sent_illust_retention_days",
         ]
 
         current = {}

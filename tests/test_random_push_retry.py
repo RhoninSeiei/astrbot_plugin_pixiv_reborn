@@ -252,6 +252,7 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             random_search_empty_retry_enabled=True,
             random_search_empty_retry_extra_depth=3,
             random_search_empty_retry_sources=0,
+            random_sent_illust_retention_days=7,
             automatic_push_excluded_tags=[],
         )
 
@@ -303,6 +304,43 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIs(hints["return"], random_search.RandomIllustDeliveryResult)
+
+    def test_random_search_uses_shared_group_send_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+            from utils.group_send_lock import get_group_send_lock
+
+            service = object.__new__(random_search.RandomSearchService)
+            self.assertIs(
+                service._get_group_lock("shared-group"),
+                get_group_send_lock("shared-group"),
+            )
+
+    async def test_cleanup_keeps_the_longer_sent_history_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_import_stubs(temp_dir)
+            from utils import random_search
+
+            original_cleanup = random_search.cleanup_old_sent_illusts
+            cleanup_days = []
+            random_search.cleanup_old_sent_illusts = (
+                lambda *, days: cleanup_days.append(days)
+            )
+            try:
+                service = object.__new__(random_search.RandomSearchService)
+                service.pixiv_config = types.SimpleNamespace(
+                    random_sent_illust_retention_days=7,
+                    llm_tool_sent_illust_retention_days=45,
+                )
+                await service._cleanup_task()
+
+                service.pixiv_config.random_sent_illust_retention_days = 365
+                await service._cleanup_task()
+            finally:
+                random_search.cleanup_old_sent_illusts = original_cleanup
+
+            self.assertEqual(cleanup_days, [45, 365])
 
     async def _run_with_patches(self, fail_ids, return_count):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -463,7 +501,8 @@ class RandomPushRetryTest(unittest.IsolatedAsyncioTestCase):
             ):
                 yield event.plain_result(f"标题: {illust.title}")
 
-            def fake_filter_sent_illusts(illusts, chat_id):
+            def fake_filter_sent_illusts(illusts, chat_id, retention_days):
+                self.assertEqual(retention_days, 7)
                 filter_call_sizes.append(len(illusts))
                 return [illust for illust in illusts if illust.id >= 7000]
 

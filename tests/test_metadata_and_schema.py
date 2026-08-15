@@ -87,6 +87,10 @@ class MetadataAndSchemaTest(unittest.TestCase):
             webui_schema["random_sent_illust_retention_days"]["max"],
         )
         self.assertEqual(
+            command_schema["llm_tool_sent_illust_retention_days"]["max"],
+            webui_schema["llm_tool_sent_illust_retention_days"]["max"],
+        )
+        self.assertEqual(
             command_schema["random_search_empty_retry_extra_depth"]["max"],
             webui_schema["random_search_empty_retry_extra_depth"]["max"],
         )

@@ -335,5 +335,13 @@
       "default": 7,
       "min": 1,
       "max": 365
+  },
+  "llm_tool_sent_illust_retention_days": {
+      "description": "LLM 搜图已发送作品保留天数",
+      "type": "int",
+      "hint": "按群记录 LLM 搜图成功发送的 Pixiv 作品，在保留期内优先选择其他作品。",
+      "default": 45,
+      "min": 1,
+      "max": 365
   }
 }

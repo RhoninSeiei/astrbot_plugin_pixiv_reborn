@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 import unittest
@@ -215,12 +216,39 @@ class FakePixivClient:
         return {}
 
 
+class AcceptedSendTimeout(Exception):
+    retcode = 1200
+    message = (
+        'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg '
+        'EventRet:\n{"result": 0, "errMsg": ""}'
+    )
+    wording = message
+    status = "failed"
+
+
 class FakeEvent:
-    def __init__(self):
+    def __init__(
+        self,
+        group_id=None,
+        fail_send=False,
+        fail_send_for=None,
+        accept_timeout_for=None,
+    ):
         self.sent = []
+        self.group_id = group_id
+        self.fail_send = fail_send
+        self.fail_send_for = set(fail_send_for or [])
+        self.accept_timeout_for = set(accept_timeout_for or [])
+
+    def get_group_id(self):
+        return self.group_id
 
     async def send(self, result):
+        if self.fail_send or getattr(result, "illust_id", None) in self.fail_send_for:
+            raise RuntimeError("send failed")
         self.sent.append(result)
+        if getattr(result, "illust_id", None) in self.accept_timeout_for:
+            raise AcceptedSendTimeout(self.message if hasattr(self, "message") else "")
 
 
 class FakeAgentContext:
@@ -299,6 +327,15 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(tools[0], self.llm_tool.PixivIllustSearchTool)
         self.assertIsInstance(tools[1], self.llm_tool.PixivNovelSearchTool)
         self.assertTrue(all(tool.handler is None for tool in tools))
+
+    def test_llm_search_uses_shared_group_send_lock(self):
+        from utils.group_send_lock import get_group_send_lock
+
+        tool = self.llm_tool.PixivIllustSearchTool()
+        self.assertIs(
+            tool._get_group_lock("shared-group"),
+            get_group_send_lock("shared-group"),
+        )
 
     def test_registered_tools_are_bound_to_plugin_main_module(self):
         tools = self.llm_tool.create_pixiv_llm_tools(
@@ -416,6 +453,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "已发送 2 张图片")
         self.assertEqual(client.calls[0][0], "Atlanta(艦隊これくしょん)")
+        self.assertEqual(client.calls[0][1]["sort"], "popular_desc")
         self.assertEqual([call[0] for call in wrapper.calls], ["search_illust"])
         self.assertEqual([item.illust_id for item in event.sent], [1, 2])
 
@@ -460,6 +498,351 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
             ["神崎蘭子 偶像大师灰姑娘女孩", "神崎蘭子"],
         )
         self.assertEqual([item.illust_id for item in event.sent], [71])
+
+    async def test_search_expands_past_three_cached_pages(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        class PagedPixivClient:
+            def __init__(self):
+                self.calls = []
+
+            def search_illust(self, word=None, page=1, **kwargs):
+                self.calls.append((word, page, kwargs))
+                next_url = f"page={page + 1}" if page < 4 else None
+                return FakeSearchResult([FakeIllust(page)], next_url=next_url)
+
+            def parse_qs(self, next_url):
+                return {"word": "神崎蘭子", "page": int(next_url.split("=")[1])}
+
+        client = PagedPixivClient()
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=client,
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+        recorded = []
+        partitioned_ids = []
+
+        async def partition(items, chat_id, retention_days):
+            partitioned_ids.append([item.id for item in items])
+            unsent = [item for item in items if item.id == 4]
+            recent = [item for item in items if item.id != 4]
+            return unsent, recent
+
+        async def record(illust_id, chat_id):
+            recorded.append((illust_id, chat_id))
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._partition_cached_illusts = partition
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool.call(
+                ContextWrapper(FakeAgentContext(event)),
+                query="神崎蘭子",
+                count=1,
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(partitioned_ids, [[1, 2, 3], [1, 2, 3, 4]])
+        self.assertEqual([item.illust_id for item in event.sent], [4])
+        self.assertEqual(recorded, [(4, "group-1")])
+
+    async def test_all_cached_results_fall_back_to_oldest_sent_item(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        client = FakePixivClient()
+        client.search_illust = lambda word, **kwargs: FakeSearchResult(
+            [FakeIllust(1), FakeIllust(2)]
+        )
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=client,
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+        recorded = []
+
+        async def partition(items, chat_id, retention_days):
+            return [], [items[1], items[0]]
+
+        async def record(illust_id, chat_id):
+            recorded.append((illust_id, chat_id))
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._partition_cached_illusts = partition
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool.call(
+                ContextWrapper(FakeAgentContext(event)),
+                query="神崎蘭子",
+                count=1,
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual([item.illust_id for item in event.sent], [2])
+        self.assertEqual(recorded, [(2, "group-1")])
+
+    async def test_failed_send_does_not_record_illust(self):
+        event = FakeEvent(group_id="group-1", fail_send_for={71})
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(),
+            pixiv_config=FakePixivConfig(),
+        )
+        recorded = []
+
+        async def record(illust_id, chat_id):
+            recorded.append((illust_id, chat_id))
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool._send_pixiv_result(
+                event,
+                [FakeIllust(71), FakeIllust(72)],
+                "神崎蘭子",
+                "神崎蘭子",
+                count=2,
+                chat_id="group-1",
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual([item.illust_id for item in event.sent], [72])
+        self.assertEqual(recorded, [(72, "group-1")])
+
+    async def test_accepted_send_timeout_is_recorded_without_sending_next_item(self):
+        event = FakeEvent(group_id="group-1", accept_timeout_for={71})
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(),
+            pixiv_config=FakePixivConfig(),
+        )
+        recorded = []
+
+        async def record(illust_id, chat_id):
+            recorded.append((illust_id, chat_id))
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool._send_pixiv_result(
+                event,
+                [FakeIllust(71), FakeIllust(72)],
+                "神崎蘭子",
+                "神崎蘭子",
+                count=1,
+                chat_id="group-1",
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual([item.illust_id for item in event.sent], [71])
+        self.assertEqual(recorded, [(71, "group-1")])
+
+    async def test_duplicate_ids_are_sent_and_recorded_once(self):
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(),
+            pixiv_config=FakePixivConfig(),
+        )
+        recorded = []
+
+        async def record(illust_id, chat_id):
+            recorded.append((illust_id, chat_id))
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool._send_pixiv_result(
+                event,
+                [FakeIllust(71), FakeIllust(71), FakeIllust(72)],
+                "神崎蘭子",
+                "神崎蘭子",
+                count=2,
+                chat_id="group-1",
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 2 张图片")
+        self.assertEqual([item.illust_id for item in event.sent], [71, 72])
+        self.assertEqual(recorded, [(71, "group-1"), (72, "group-1")])
+
+    async def test_content_filtering_expands_search_past_three_pages(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        class PagedPixivClient:
+            def __init__(self):
+                self.calls = []
+
+            def search_illust(self, word=None, page=1, **kwargs):
+                self.calls.append(page)
+                illust = FakeIllust(page)
+                illust.x_restrict = 1 if page < 4 else 0
+                next_url = f"page={page + 1}" if page < 4 else None
+                return FakeSearchResult([illust], next_url=next_url)
+
+            def parse_qs(self, next_url):
+                return {"word": "神崎蘭子", "page": int(next_url.split("=")[1])}
+
+        client = PagedPixivClient()
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=client,
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+
+        async def partition(items, chat_id, retention_days):
+            return list(items), []
+
+        async def record(illust_id, chat_id):
+            pass
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._partition_cached_illusts = partition
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool.call(
+                ContextWrapper(FakeAgentContext(event)),
+                query="神崎蘭子",
+                count=1,
+                filters="safe",
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual(client.calls, [1, 2, 3, 4])
+        self.assertEqual([item.illust_id for item in event.sent], [4])
+
+    async def test_same_group_concurrent_searches_select_different_works(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        class ConcurrentPixivClient:
+            def search_illust(self, word, **kwargs):
+                return FakeSearchResult([FakeIllust(1), FakeIllust(2)])
+
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=ConcurrentPixivClient(),
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+        recorded = set()
+
+        async def partition(items, chat_id, retention_days):
+            await asyncio.sleep(0)
+            return [item for item in items if item.id not in recorded], []
+
+        async def record(illust_id, chat_id):
+            recorded.add(illust_id)
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._partition_cached_illusts = partition
+        tool._record_sent_illust = record
+        events = [FakeEvent(group_id="group-1"), FakeEvent(group_id="group-1")]
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            results = await asyncio.gather(
+                *[
+                    tool.call(
+                        ContextWrapper(FakeAgentContext(event)),
+                        query="神崎蘭子",
+                        count=1,
+                    )
+                    for event in events
+                ]
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(results, ["已发送 1 张图片", "已发送 1 张图片"])
+        self.assertEqual(
+            [[item.illust_id for item in event.sent] for event in events],
+            [[1], [2]],
+        )
+
+    async def test_all_cached_search_stops_after_ten_pages(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        class TenPagePixivClient:
+            def __init__(self):
+                self.calls = []
+
+            def search_illust(self, word=None, page=1, **kwargs):
+                self.calls.append(page)
+                return FakeSearchResult([FakeIllust(page)], next_url=f"page={page + 1}")
+
+            def parse_qs(self, next_url):
+                return {"word": "神崎蘭子", "page": int(next_url.split("=")[1])}
+
+        client = TenPagePixivClient()
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=client,
+            pixiv_config=FakePixivConfig(),
+            pixiv_client_wrapper=FakeClientWrapper(),
+        )
+
+        async def partition(items, chat_id, retention_days):
+            return [], list(items)
+
+        async def record(illust_id, chat_id):
+            pass
+
+        async def fake_send_pixiv_image(client, event, illust, detail, show_details):
+            yield types.SimpleNamespace(illust_id=illust.id)
+
+        tool._partition_cached_illusts = partition
+        tool._record_sent_illust = record
+        original_send = self.llm_tool.send_pixiv_image
+        self.llm_tool.send_pixiv_image = fake_send_pixiv_image
+        try:
+            result = await tool.call(
+                ContextWrapper(FakeAgentContext(event)),
+                query="神崎蘭子",
+                count=1,
+            )
+        finally:
+            self.llm_tool.send_pixiv_image = original_send
+
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual(client.calls, list(range(1, 11)))
+        self.assertEqual([item.illust_id for item in event.sent], [1])
 
 
 class PixivV4273NativeToolTest(unittest.IsolatedAsyncioTestCase):

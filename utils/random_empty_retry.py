@@ -82,3 +82,24 @@ def is_random_push_image_failure_notice(message_content):
         texts.append(str(message_content))
 
     return any(marker in text for text in texts for marker in failure_markers)
+
+
+def is_send_timeout_after_accept(error) -> bool:
+    """判断 QQ sendMsg 是否在服务端受理后等待消息更新回执超时。"""
+    text_parts = [repr(error), str(error)]
+    for attr in ("retcode", "message", "wording", "status"):
+        value = getattr(error, attr, None)
+        if value is not None:
+            text_parts.append(str(value))
+    text = "\n".join(text_parts).replace('\\"', '"')
+    compact_text = "".join(text.split())
+
+    has_timeout_retcode = (
+        getattr(error, "retcode", None) == 1200
+        or "retcode=1200" in text
+        or "retcode': 1200" in text
+        or '"retcode": 1200' in text
+    )
+    has_send_timeout = "Timeout:" in text and "sendMsg" in text
+    has_success_event = '"result":0' in compact_text and '"errMsg":""' in compact_text
+    return has_timeout_retcode and has_send_timeout and has_success_event

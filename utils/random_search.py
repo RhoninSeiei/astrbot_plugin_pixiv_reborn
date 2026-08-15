@@ -40,8 +40,10 @@ from .random_empty_retry import (
     build_retry_source_sequence,
     enforce_random_push_delivery_policy,
     is_random_push_image_failure_notice,
+    is_send_timeout_after_accept,
     resolve_retry_depth,
 )
+from .group_send_lock import get_group_send_lock, get_group_send_lock_registry
 from .random_schedule import normalize_schedule_time
 from .random_group_config import resolve_random_search_runtime_config
 
@@ -76,7 +78,7 @@ class RandomSearchService:
         # 使用数据库存储调度时间，不再使用内存字典
         # 防止同一群聊并发执行的状态: {chat_id: bool}
         self.execution_locks = {}
-        self.group_locks = {}
+        self.group_locks = get_group_send_lock_registry()
 
         max_concurrent_jobs = getattr(
             self.pixiv_config, "random_search_max_concurrent_jobs", 2
@@ -180,11 +182,7 @@ class RandomSearchService:
         return group_config.min_interval_minutes, group_config.max_interval_minutes
 
     def _get_group_lock(self, chat_id: str) -> asyncio.Lock:
-        lock = self.group_locks.get(chat_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self.group_locks[chat_id] = lock
-        return lock
+        return get_group_send_lock(chat_id)
 
     def _empty_retry_enabled(self) -> bool:
         return bool(
@@ -280,25 +278,7 @@ class RandomSearchService:
 
     def _is_send_timeout_after_accept(self, error) -> bool:
         """判断 QQ sendMsg 是否在受理后等待消息更新回执超时。"""
-        text_parts = [repr(error), str(error)]
-        for attr in ("retcode", "message", "wording", "status"):
-            value = getattr(error, attr, None)
-            if value is not None:
-                text_parts.append(str(value))
-        text = chr(10).join(text_parts).replace('\\"', '"')
-        compact_text = "".join(text.split())
-
-        has_timeout_retcode = (
-            getattr(error, "retcode", None) == 1200
-            or "retcode=1200" in text
-            or "retcode': 1200" in text
-            or '"retcode": 1200' in text
-        )
-        has_send_timeout = "Timeout:" in text and "sendMsg" in text
-        has_success_event = (
-            '"result":0' in compact_text and '"errMsg":""' in compact_text
-        )
-        return has_timeout_retcode and has_send_timeout and has_success_event
+        return is_send_timeout_after_accept(error)
 
     async def _send_message_with_attempt_record(
         self,
@@ -783,7 +763,14 @@ class RandomSearchService:
         try:
             logger.info("开始清理过期的已发送作品记录...")
             # 获取配置
-            days = self.pixiv_config.random_sent_illust_retention_days
+            days = max(
+                self.pixiv_config.random_sent_illust_retention_days,
+                getattr(
+                    self.pixiv_config,
+                    "llm_tool_sent_illust_retention_days",
+                    45,
+                ),
+            )
 
             # 使用 to_thread 防止数据库操作阻塞异步循环
             await asyncio.to_thread(cleanup_old_sent_illusts, days=days)
@@ -890,7 +877,10 @@ class RandomSearchService:
             current_illusts = json_result.illusts
             if current_illusts:
                 unsent_illusts = await asyncio.to_thread(
-                    filter_sent_illusts, current_illusts, chat_id
+                    filter_sent_illusts,
+                    current_illusts,
+                    chat_id,
+                    self.pixiv_config.random_sent_illust_retention_days,
                 )
                 all_illusts.extend(unsent_illusts)
                 page_count += 1
@@ -1093,7 +1083,10 @@ class RandomSearchService:
             # 过滤已发送的作品
             before_sent_filter_count = len(initial_illusts)
             initial_illusts = await asyncio.to_thread(
-                filter_sent_illusts, initial_illusts, chat_id
+                filter_sent_illusts,
+                initial_illusts,
+                chat_id,
+                self.pixiv_config.random_sent_illust_retention_days,
             )
             logger.info(
                 "排行榜 %s 的随机搜索发送缓存过滤统计: 累计结果 %s 个，已发送缓存过滤 %s 个，待条件过滤 %s 个。"

@@ -525,16 +525,23 @@ def upsert_random_search_group_config(
         return None
 
 
-def add_sent_illust(illust_id: int, chat_id: str):
+def add_sent_illust(illust_id: int, chat_id: str, sent_at: datetime = None):
     """记录已发送的作品"""
     try:
+        timestamp = sent_at or datetime.now()
         with db.atomic():
-            SentIllust.create(
-                illust_id=illust_id, chat_id=chat_id, sent_at=datetime.now()
+            (
+                SentIllust.insert(
+                    illust_id=illust_id,
+                    chat_id=chat_id,
+                    sent_at=timestamp,
+                )
+                .on_conflict(
+                    conflict_target=[SentIllust.illust_id, SentIllust.chat_id],
+                    update={SentIllust.sent_at: timestamp},
+                )
+                .execute()
             )
-    except pw.IntegrityError:
-        # 记录已存在，忽略
-        pass
     except Exception as e:
         logger.error(f"添加已发送作品记录失败: {e}")
 
@@ -651,7 +658,9 @@ def cleanup_old_sent_illusts(days: int = 1):
         logger.error(f"清理过期已发送作品记录失败: {e}")
 
 
-def filter_sent_illusts(illusts, chat_id: str) -> list:
+def filter_sent_illusts(
+    illusts, chat_id: str, retention_days: int | None = None
+) -> list:
     """过滤掉已发送的作品"""
     try:
         candidate_ids = [
@@ -663,13 +672,14 @@ def filter_sent_illusts(illusts, chat_id: str) -> list:
             return list(illusts)
 
         # 只查询当前候选中已发送的作品ID，避免读取该群全部历史记录
-        sent_ids = set(
-            record.illust_id
-            for record in SentIllust.select(SentIllust.illust_id).where(
-                (SentIllust.chat_id == chat_id)
-                & (SentIllust.illust_id.in_(candidate_ids))
-            )
+        query = SentIllust.select(SentIllust.illust_id).where(
+            (SentIllust.chat_id == chat_id)
+            & (SentIllust.illust_id.in_(candidate_ids))
         )
+        if retention_days is not None:
+            cutoff = datetime.now() - timedelta(days=max(int(retention_days), 1))
+            query = query.where(SentIllust.sent_at >= cutoff)
+        sent_ids = {record.illust_id for record in query}
 
         # 过滤掉已发送的作品
         filtered_illusts = []
@@ -684,6 +694,52 @@ def filter_sent_illusts(illusts, chat_id: str) -> list:
     except Exception as e:
         logger.error(f"过滤已发送作品失败: {e}")
         return illusts  # 出错时返回原列表
+
+
+def partition_sent_illusts(
+    illusts,
+    chat_id: str,
+    retention_days: int = 45,
+    now: datetime = None,
+) -> tuple[list, list]:
+    """按保留期拆分未发送作品和仍在缓存期内的作品。"""
+    items = list(illusts)
+    candidate_ids = [
+        getattr(item, "id", None)
+        for item in items
+        if getattr(item, "id", None) is not None
+    ]
+    if not candidate_ids or not chat_id:
+        return items, []
+
+    try:
+        current_time = now or datetime.now()
+        days = max(int(retention_days), 1)
+        cutoff = current_time - timedelta(days=days)
+        records = {
+            record.illust_id: record.sent_at
+            for record in SentIllust.select(
+                SentIllust.illust_id, SentIllust.sent_at
+            ).where(
+                (SentIllust.chat_id == str(chat_id))
+                & (SentIllust.illust_id.in_(candidate_ids))
+            )
+        }
+
+        unsent = []
+        recent = []
+        for item in items:
+            sent_at = records.get(getattr(item, "id", None))
+            if sent_at is None or sent_at < cutoff:
+                unsent.append(item)
+            else:
+                recent.append((sent_at, item))
+
+        recent.sort(key=lambda entry: entry[0])
+        return unsent, [item for _, item in recent]
+    except Exception as e:
+        logger.error(f"按保留期拆分已发送作品失败: {e}")
+        return items, []
 
 
 def get_schedule_time(chat_id: str) -> datetime:

@@ -125,6 +125,12 @@ class PixivConfigDefaultsTest(unittest.TestCase):
             PixivConfig({"subscription_force_forward": True}).subscription_force_forward
         )
 
+    def test_llm_tool_sent_retention_defaults_to_45_days(self):
+        install_import_stubs()
+        from utils.config import PixivConfig
+
+        self.assertEqual(PixivConfig({}).llm_tool_sent_illust_retention_days, 45)
+
 
 if __name__ == "__main__":
     unittest.main()
