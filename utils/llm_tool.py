@@ -67,30 +67,6 @@ PIXIV_WORK_TAGS = {
     "ファンタシースターオンライン2",
 }
 
-PIXIV_QUERY_FILLERS = (
-    "来点",
-    "來點",
-    "发点",
-    "發點",
-    "发张",
-    "發張",
-    "给我",
-    "給我",
-    "图片",
-    "圖片",
-    "插画",
-    "插圖",
-    "壁纸",
-    "壁紙",
-    "pixiv",
-    "搜索",
-    "搜",
-    "机器人",
-    "的图",
-    "的圖",
-)
-
-
 @dataclass
 class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     """
@@ -160,8 +136,9 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             filters = self._normalize_filters(kwargs.get("filters", "safe"))
             tags = self._normalize_tags(kwargs.get("tags"))
             logger.info(
-                "ToolLoopAgentRunner 执行 pixiv_search_illust: query=%r, count=%s, filters=%s, tags=%s"
-                % (query, count, filters, tags)
+                "ToolLoopAgentRunner 执行 pixiv_search_illust: "
+                "query=%r, count=%s, filters=%s, tags=%s, source_text=%r"
+                % (query, count, filters, tags, source_text)
             )
 
             if not self.pixiv_client:
@@ -231,12 +208,6 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 tags.append(tag)
         return self._dedupe(tags)
 
-    def _clean_query_text(self, text: str) -> str:
-        cleaned = text.strip()
-        for filler in PIXIV_QUERY_FILLERS:
-            cleaned = cleaned.replace(filler, " ")
-        return " ".join(cleaned.replace("，", " ").replace(",", " ").split())
-
     def _dedupe(self, values: list[str]) -> list[str]:
         result = []
         seen = set()
@@ -253,13 +224,13 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     ) -> list[dict[str, str]]:
         normalized_tags = self._normalize_tags(tags or [])
         alias_tags = self._extract_alias_tags(query)
-        cleaned_query = self._clean_query_text(query)
-        loose_queries = self._dedupe([cleaned_query])
+        structured_query = " ".join(query.strip().split())
+        loose_queries = self._dedupe([structured_query])
 
         known_tags = self._dedupe(normalized_tags + alias_tags)
         work_tags = [tag for tag in known_tags if tag in PIXIV_WORK_TAGS]
         character_tags = [tag for tag in known_tags if tag not in PIXIV_WORK_TAGS]
-        inferred_tags = self._dedupe([cleaned_query, *cleaned_query.split()])
+        inferred_tags = self._dedupe([structured_query, *structured_query.split()])
 
         exact_tags = self._dedupe(character_tags + inferred_tags + work_tags)
         candidates: list[dict[str, str]] = []

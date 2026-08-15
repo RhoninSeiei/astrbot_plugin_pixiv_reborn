@@ -139,11 +139,14 @@ def is_astrbot_module(name):
 
 
 class FakeLogger:
+    def __init__(self):
+        self.info_messages = []
+
     def debug(self, *args, **kwargs):
         pass
 
     def info(self, *args, **kwargs):
-        pass
+        self.info_messages.append(" ".join(str(arg) for arg in args))
 
     def warning(self, *args, **kwargs):
         pass
@@ -269,7 +272,8 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.llm_tool = self.__class__.llm_tool_module
         self.original_logger = self.llm_tool.logger
-        self.llm_tool.logger = FakeLogger()
+        self.fake_logger = FakeLogger()
+        self.llm_tool.logger = self.fake_logger
 
     def tearDown(self):
         self.llm_tool.logger = self.original_logger
@@ -314,6 +318,8 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
     def test_query_builds_arbitrary_exact_tags_without_alias(self):
         tool = self.llm_tool.PixivIllustSearchTool()
 
+        self.assertEqual(tool._extract_alias_tags("神崎蘭子"), [])
+
         candidates = tool._build_search_candidates(
             query="神崎蘭子 偶像大师灰姑娘女孩",
             tags=[],
@@ -329,6 +335,20 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "神崎蘭子 偶像大师灰姑娘女孩 机器人 神崎蘭子",
             [item["word"] for item in candidates],
+        )
+
+    def test_structured_query_is_never_modified_as_request_text(self):
+        tool = self.llm_tool.PixivIllustSearchTool()
+
+        candidates = tool._build_search_candidates(
+            query="机器人少女",
+            tags=[],
+            source_text="任意自然语言请求",
+        )
+
+        self.assertEqual(
+            (candidates[0]["word"], candidates[0]["search_target"]),
+            ("机器人少女", "exact_match_for_tags"),
         )
 
     def test_source_text_does_not_change_structured_query_candidates(self):
@@ -347,6 +367,23 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(candidates, without_source)
+
+    async def test_source_text_is_recorded_for_diagnostics(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        tool = self.llm_tool.PixivIllustSearchTool()
+        source_text = "群聊中的原始请求"
+
+        result = await tool.call(
+            ContextWrapper(FakeAgentContext(FakeEvent())),
+            query="结构化tag",
+            source_text=source_text,
+        )
+
+        self.assertEqual(result, "错误: Pixiv客户端未初始化")
+        self.assertTrue(
+            any(source_text in message for message in self.fake_logger.info_messages)
+        )
 
     async def test_call_uses_candidate_tags_and_sends_images_in_event_context(self):
         from astrbot.core.agent.run_context import ContextWrapper
