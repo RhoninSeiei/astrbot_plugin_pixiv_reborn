@@ -4,14 +4,15 @@
 
 **Goal:** Replace the legacy Pixiv LLM tool handler wrapper with AstrBot v4.27.3 native `FunctionTool` execution.
 
-**Architecture:** Return the existing `FunctionTool` subclasses from the factory. Let AstrBot choose their overridden `call()` methods, and rely on the core manager's shallow `ToolSet` construction for shared object identity.
+**Architecture:** Return the existing `FunctionTool` subclasses from the factory. Let AstrBot choose their overridden `call()` methods, and let the core manager expose them through its official `_PermissionGuardedTool` proxy.
 
 **Tech Stack:** Python 3.12, AstrBot v4.27.3 `FunctionTool`, `unittest`.
 
 ## Global Constraints
 
 The registered names remain `pixiv_search_illust` and `pixiv_search_novel`.
-`context.get_llm_tool_manager()`, `event.request_llm()`, and `ToolLoopAgentRunner` must use the same tool objects.
+The manager must retain the original Pixiv tools; `event.request_llm()` and `ToolLoopAgentRunner` must use AstrBot's permission proxies that delegate to those original tools.
+The plugin must not patch `FunctionToolManager.get_full_tool_set()` or bypass `_PermissionGuardedTool`.
 No AstrBot core, other plugin, container lifecycle, schema, or subscription data changes are permitted.
 Production deployment uses target-plugin reload only.
 
@@ -25,7 +26,7 @@ Production deployment uses target-plugin reload only.
 
 **Interfaces:**
 - Consumes: `FunctionTool.call(context: ContextWrapper, **kwargs)` and `FunctionToolExecutor._execute_local(...)`.
-- Produces: `create_pixiv_llm_tools(...) -> list[FunctionTool]` containing the original subclass instances with `handler is None`.
+- Produces: `create_pixiv_llm_tools(...) -> list[FunctionTool]` containing the original subclass instances with `handler is None`; AstrBot may expose official permission proxies around them.
 
 - [ ] **Step 1: Write the failing executor test**
 
@@ -39,7 +40,7 @@ Expected: failure showing the factory returned a wrapper with a non-null handler
 
 - [ ] **Step 3: Remove the legacy adapter**
 
-Return `tool_impls` from `create_pixiv_llm_tools()`. Remove `_as_astrbot_function_tool`, its obsolete imports, and the manager monkey patch. Update module binding so native tools retain the plugin module and `handler_module_path` without assuming a handler exists.
+Return `tool_impls` from `create_pixiv_llm_tools()`. Remove `_as_astrbot_function_tool`, its obsolete imports, and the manager monkey patch. Update module binding so native tools retain the plugin module and `handler_module_path` without assuming a handler exists. Verify that the official permission proxy delegates to the original tool.
 
 - [ ] **Step 4: Verify focused and full tests**
 

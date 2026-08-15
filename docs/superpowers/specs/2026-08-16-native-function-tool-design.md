@@ -15,9 +15,12 @@ AstrBot selects the native `call` branch and supplies the current
 `ContextWrapper`.
 
 The plugin will stop patching `FunctionToolManager.get_full_tool_set()`.
-AstrBot v4.27.3 already constructs `ToolSet` from a shallow copy of
-`func_list`, preserving each tool object. Existing identity assertions will
-remain and cover the manager, request tool set, and LLM request.
+AstrBot v4.27.3 wraps registered tools in its official
+`_PermissionGuardedTool` before exposing a `ToolSet`. The manager retains the
+original Pixiv tool while requests and the runner use the permission proxy,
+which delegates `call()` to that same original tool. Tests will verify this
+delegation instead of requiring Python object identity across the proxy
+boundary.
 
 ## Compatibility
 
@@ -30,6 +33,6 @@ needed when `handler` is absent.
 
 Tests must demonstrate the current wrapper enters AstrBot's handler branch and
 fails with an extra positional argument before the change. After the change,
-the same tools must enter the native `call` branch, execute through
-`FunctionToolExecutor`, and preserve object identity across all three tool
-views.
+the registered tools must enter the native `call` branch, execute through
+`FunctionToolExecutor`, and remain the delegate behind AstrBot's official
+permission proxy.
