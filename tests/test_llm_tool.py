@@ -10,7 +10,12 @@ PROJECT_ROOT = (
     if WORKTREE_ROOT.parent.name == ".worktrees"
     else WORKTREE_ROOT.parent
 )
-ASTRBOT_ROOT = PROJECT_ROOT / "AstrBot"
+CONTAINER_ASTRBOT_ROOT = Path("/AstrBot")
+ASTRBOT_ROOT = (
+    CONTAINER_ASTRBOT_ROOT
+    if (CONTAINER_ASTRBOT_ROOT / "astrbot").is_dir()
+    else PROJECT_ROOT / "AstrBot"
+)
 if str(ASTRBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_ROOT))
 
