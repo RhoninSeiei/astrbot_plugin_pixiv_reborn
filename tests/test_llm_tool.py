@@ -241,11 +241,7 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
             ):
                 sys.modules.pop(name, None)
         clear_module_attrs(UTILS_MODULES_TO_RELOAD)
-        try:
-            cls.v4273_runtime = load_v4273_runtime()
-        except (ImportError, AttributeError):
-            cls.v4273_runtime = None
-            install_astrbot_import_stubs()
+        install_astrbot_import_stubs()
         install_pixiv_utils_stub()
 
         from utils import llm_tool
