@@ -57,6 +57,17 @@ class FakeAuthClient:
         self.calls += 1
 
 
+class SequencedAuthClient(FakeAuthClient):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = list(failures)
+
+    def auth(self, refresh_token):
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+
+
 class FakeConfig:
     refresh_token = "refresh-token"
     refresh_interval = 1
@@ -103,6 +114,60 @@ class PixivClientAuthTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake_client.calls, 1)
 
+    async def test_authenticate_recovers_from_transient_ssl_eof(self):
+        client_module = import_client_module()
+        fake_client = SequencedAuthClient(
+            [client_module.PixivError("SSLEOFError: UNEXPECTED_EOF_WHILE_READING")]
+        )
+        wrapper = self.make_wrapper(client_module, fake_client)
+        delays = []
+        original_sleep = client_module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+
+        client_module.asyncio.sleep = fake_sleep
+        try:
+            self.assertTrue(await wrapper.authenticate())
+        finally:
+            client_module.asyncio.sleep = original_sleep
+
+        self.assertEqual(fake_client.calls, 2)
+        self.assertEqual(delays, [0.01])
+        self.assertIsNone(wrapper._last_auth_failure_at)
+
+    async def test_authenticate_does_not_retry_invalid_grant(self):
+        client_module = import_client_module()
+        fake_client = SequencedAuthClient(
+            [client_module.PixivError("invalid_grant: refresh token expired")]
+        )
+        wrapper = self.make_wrapper(client_module, fake_client)
+
+        self.assertFalse(await wrapper.authenticate())
+        self.assertEqual(fake_client.calls, 1)
+        self.assertIsNotNone(wrapper._last_auth_failure_at)
+
+    async def test_authenticate_stops_after_configured_transient_retries(self):
+        client_module = import_client_module()
+        error = client_module.PixivError("SSLEOFError: UNEXPECTED_EOF_WHILE_READING")
+        fake_client = SequencedAuthClient([error, error, error])
+        wrapper = self.make_wrapper(client_module, fake_client)
+        delays = []
+        original_sleep = client_module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+
+        client_module.asyncio.sleep = fake_sleep
+        try:
+            self.assertFalse(await wrapper.authenticate())
+        finally:
+            client_module.asyncio.sleep = original_sleep
+
+        self.assertEqual(fake_client.calls, 3)
+        self.assertEqual(delays, [0.01, 0.02])
+        self.assertIsNotNone(wrapper._last_auth_failure_at)
+
     async def test_periodic_token_refresh_uses_threaded_auth(self):
         client_module = import_client_module()
         wrapper = self.make_wrapper(client_module)
@@ -131,6 +196,30 @@ class PixivClientAuthTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(wrapper.client_api.calls, 1)
+
+    async def test_periodic_refresh_recovers_from_transient_ssl_eof(self):
+        client_module = import_client_module()
+        fake_client = SequencedAuthClient(
+            [client_module.PixivError("SSLEOFError: UNEXPECTED_EOF_WHILE_READING")]
+        )
+        wrapper = self.make_wrapper(client_module, fake_client)
+        delays = []
+        original_sleep = client_module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            if len(delays) > 2:
+                raise asyncio.CancelledError
+
+        client_module.asyncio.sleep = fake_sleep
+        try:
+            await wrapper.periodic_token_refresh()
+        finally:
+            client_module.asyncio.sleep = original_sleep
+
+        self.assertEqual(fake_client.calls, 2)
+        self.assertEqual(delays[:2], [60, 0.01])
+        self.assertIsNone(wrapper._last_auth_failure_at)
 
     async def test_call_pixiv_api_retries_retryable_errors_with_backoff(self):
         client_module = import_client_module()

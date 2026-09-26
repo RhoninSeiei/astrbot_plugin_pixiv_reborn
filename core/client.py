@@ -180,6 +180,8 @@ class PixivClientWrapper:
             "unavailable",
             "bad gateway",
             "gateway timeout",
+            "ssleoferror",
+            "unexpected_eof_while_reading",
         )
         if isinstance(error, (PixivError, TimeoutError, ConnectionError)):
             return any(marker in text for marker in retryable_markers)
@@ -201,6 +203,28 @@ class PixivClientWrapper:
 
     def _mark_auth_failure(self):
         self._last_auth_failure_at = time.monotonic()
+
+    async def _authenticate_with_retry(self, refresh_token: str) -> None:
+        retry_count = self._coerce_int_config("pixiv_api_retry_count", 2, 0, 5)
+        base_delay = self._coerce_float_config(
+            "pixiv_api_retry_base_delay", 1.0, 0.0, 60.0
+        )
+        for attempt in range(retry_count + 1):
+            try:
+                await asyncio.to_thread(
+                    self.client_api.auth, refresh_token=refresh_token
+                )
+                return
+            except Exception as error:
+                if attempt >= retry_count or not self._is_retryable_api_error(error):
+                    raise
+                delay = base_delay * (2**attempt)
+                logger.warning(
+                    f"Pixiv 认证连接失败，将在 {delay:.2f} 秒后重试 "
+                    f"{attempt + 1}/{retry_count}: {error}"
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
     async def authenticate(self) -> bool:
         """尝试使用配置的凭据进行 Pixiv API 认证"""
@@ -225,9 +249,7 @@ class PixivClientWrapper:
                 return False
 
             try:
-                await asyncio.to_thread(
-                    self.client_api.auth, refresh_token=self.pixiv_config.refresh_token
-                )
+                await self._authenticate_with_retry(self.pixiv_config.refresh_token)
                 self._mark_auth_success()
                 return True
             except Exception as e:
@@ -260,10 +282,7 @@ class PixivClientWrapper:
                 logger.info("Pixiv Token 刷新任务：尝试使用 Refresh Token 进行认证...")
                 try:
                     async with self._auth_lock:
-                        await asyncio.to_thread(
-                            self.client_api.auth,
-                            refresh_token=current_refresh_token,
-                        )
+                        await self._authenticate_with_retry(current_refresh_token)
                         self._mark_auth_success()
                     logger.info("Pixiv Token 刷新任务：认证调用成功。")
 
