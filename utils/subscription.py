@@ -63,7 +63,9 @@ class SubscriptionService:
     async def check_artist_updates(self, sub):
         """检查画师更新"""
         api: AppPixivAPI = self.client
-        json_result = await asyncio.to_thread(api.user_illusts, sub.target_id)
+        json_result = await self.client_wrapper.call_pixiv_api(
+            api.user_illusts, sub.target_id
+        )
 
         if not json_result or not json_result.illusts:
             return

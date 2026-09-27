@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -40,6 +41,14 @@ class FakeIllust:
 class FakeClient:
     def user_illusts(self, target_id):
         return types.SimpleNamespace(illusts=[FakeIllust(2)])
+
+
+class DirectClientWrapper:
+    def __init__(self, client):
+        self.client_api = client
+
+    async def call_pixiv_api(self, func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 class FakeMessageChain:
@@ -93,6 +102,8 @@ def load_subscription_module():
 
     pixivpy3 = types.ModuleType("pixivpy3")
     pixivpy3.AppPixivAPI = object
+    pixivpy3.ByPassSniApi = object
+    pixivpy3.PixivError = type("FakePixivError", (Exception,), {})
 
     module_name = "task_two_subscription.utils.subscription"
     package = types.ModuleType("task_two_subscription")
@@ -141,7 +152,119 @@ def load_subscription_module():
     return subscription
 
 
+def load_client_module():
+    module_name = "task_two_subscription.core.client"
+    core_package = types.ModuleType("task_two_subscription.core")
+    core_package.__path__ = [str(Path(__file__).resolve().parents[1] / "core")]
+    sys.modules["task_two_subscription.core"] = core_package
+    sys.modules.pop(module_name, None)
+    module_path = Path(__file__).resolve().parents[1] / "core" / "client.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_artist_lookup_retries_ssl_eof_before_advancing_cursor(self):
+        subscription = load_subscription_module()
+        client_module = load_client_module()
+        calls = []
+        updated_illust_ids = []
+
+        class FlakyClient:
+            def user_illusts(self, target_id):
+                calls.append(target_id)
+                if len(calls) == 1:
+                    raise client_module.PixivError(
+                        "SSLEOFError: UNEXPECTED_EOF_WHILE_READING"
+                    )
+                return types.SimpleNamespace(illusts=[FakeIllust(2)])
+
+        client = FlakyClient()
+        wrapper = object.__new__(client_module.PixivClientWrapper)
+        wrapper.client_api = client
+        wrapper.pixiv_config = types.SimpleNamespace(
+            pixiv_api_max_concurrent_requests=1,
+            pixiv_api_retry_count=2,
+            pixiv_api_retry_base_delay=0,
+        )
+        service = object.__new__(subscription.SubscriptionService)
+        service.client = client
+        service.client_wrapper = wrapper
+        service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
+        sub = types.SimpleNamespace(
+            target_id="123",
+            target_name="artist",
+            last_notified_illust_id=1,
+            chat_id="456",
+            sub_type="artist",
+        )
+
+        original_filter_items = subscription.filter_items
+        original_update_last_notified_id = subscription.update_last_notified_id
+        try:
+            subscription.filter_items = lambda *args, **kwargs: ([], [])
+            subscription.update_last_notified_id = (
+                lambda chat_id, sub_type, target_id, illust_id: updated_illust_ids.append(
+                    illust_id
+                )
+            )
+            await service.check_artist_updates(sub)
+        finally:
+            subscription.filter_items = original_filter_items
+            subscription.update_last_notified_id = original_update_last_notified_id
+
+        self.assertEqual(calls, ["123", "123"])
+        self.assertEqual(updated_illust_ids, [2])
+
+    async def test_artist_lookup_exhausts_retries_without_advancing_cursor(self):
+        subscription = load_subscription_module()
+        client_module = load_client_module()
+        calls = []
+        updated_illust_ids = []
+
+        class FailingClient:
+            def user_illusts(self, target_id):
+                calls.append(target_id)
+                raise client_module.PixivError(
+                    "SSLEOFError: UNEXPECTED_EOF_WHILE_READING"
+                )
+
+        client = FailingClient()
+        wrapper = object.__new__(client_module.PixivClientWrapper)
+        wrapper.client_api = client
+        wrapper.pixiv_config = types.SimpleNamespace(
+            pixiv_api_max_concurrent_requests=1,
+            pixiv_api_retry_count=2,
+            pixiv_api_retry_base_delay=0,
+        )
+        service = object.__new__(subscription.SubscriptionService)
+        service.client = client
+        service.client_wrapper = wrapper
+        service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
+        sub = types.SimpleNamespace(
+            target_id="123",
+            target_name="artist",
+            last_notified_illust_id=1,
+            chat_id="456",
+            sub_type="artist",
+        )
+
+        original_update_last_notified_id = subscription.update_last_notified_id
+        try:
+            subscription.update_last_notified_id = (
+                lambda *args: updated_illust_ids.append(args[-1])
+            )
+            with self.assertRaises(client_module.PixivError):
+                await service.check_artist_updates(sub)
+        finally:
+            subscription.update_last_notified_id = original_update_last_notified_id
+
+        self.assertEqual(calls, ["123", "123", "123"])
+        self.assertEqual(updated_illust_ids, [])
+
     async def test_send_update_requests_atomic_multi_page_delivery(self):
         subscription = load_subscription_module()
         captured_kwargs = {}
@@ -196,6 +319,7 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
         try:
             service = object.__new__(subscription.SubscriptionService)
             service.client = FakeClient()
+            service.client_wrapper = DirectClientWrapper(service.client)
             service.pixiv_config = types.SimpleNamespace(
                 automatic_push_excluded_tags=["ntr", "悪堕ち"]
             )
@@ -234,6 +358,7 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
             service = object.__new__(subscription.SubscriptionService)
             service.client = FakeClient()
+            service.client_wrapper = DirectClientWrapper(service.client)
             service.send_update = failed_send_update
             service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
             sub = types.SimpleNamespace(
@@ -281,6 +406,7 @@ class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
             service = object.__new__(subscription.SubscriptionService)
             service.client = FakeClient()
+            service.client_wrapper = DirectClientWrapper(service.client)
             service.context = FakeContext()
             service.pixiv_config = types.SimpleNamespace(
                 automatic_push_excluded_tags=[],
