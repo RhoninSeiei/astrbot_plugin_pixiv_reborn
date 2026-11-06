@@ -1,3 +1,4 @@
+import asyncio
 import random
 
 
@@ -103,3 +104,33 @@ def is_send_timeout_after_accept(error) -> bool:
     has_send_timeout = "Timeout:" in text and "sendMsg" in text
     has_success_event = '"result":0' in compact_text and '"errMsg":""' in compact_text
     return has_timeout_retcode and has_send_timeout and has_success_event
+
+
+def is_send_outcome_unknown(error) -> bool:
+    """After dispatch, require positive rejection evidence before allowing retry."""
+    if is_send_timeout_after_accept(error):
+        return False
+    if isinstance(error, (asyncio.TimeoutError, ConnectionError)):
+        return True
+    parts = [type(error).__name__, str(error)]
+    for attr in ("message", "wording", "status", "retcode"):
+        parts.append(str(getattr(error, attr, "")))
+    text = " ".join(parts).lower()
+    has_transport_uncertainty = (
+        any(marker in text for marker in ("timeout", "timed out", "超时"))
+        or any(marker in text for marker in (
+            "disconnect", "connectionclosed", "connection closed", "connection reset",
+            "payload is not completed", "payloaderror", "incomplete response",
+        ))
+    )
+    if has_transport_uncertainty:
+        return True
+    definite_rejections = (
+        "rich media transfer failed",
+        "rich media upload failed",
+        "media upload failed",
+        "message rejected",
+        "message was not accepted",
+        "platform not found",
+    )
+    return not any(marker in text for marker in definite_rejections)

@@ -4,6 +4,7 @@ import hashlib
 import io
 import base64
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 from fpdf import FPDF
@@ -27,9 +28,9 @@ from .pixiv_utils import (
 )
 from .random_empty_retry import (
     is_random_push_image_failure_notice,
-    is_send_timeout_after_accept,
 )
 from .group_send_lock import get_group_send_lock
+from .delivery_guard import delivery_status, guarded_send
 from .access_policy import resolve_content_mode
 
 
@@ -375,7 +376,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                     if page_count >= initial_pages:
                         if not chat_id:
                             break
-                        unsent, _ = await self._partition_cached_illusts(
+                        unsent, _ = await self._partition_delivery_history(
+                            event,
                             all_illusts,
                             chat_id,
                             retention_days,
@@ -406,7 +408,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             )
             selected_illusts = sorted_illusts
             if chat_id:
-                unsent, recent = await self._partition_cached_illusts(
+                unsent, recent = await self._partition_delivery_history(
+                    event,
                     sorted_illusts,
                     chat_id,
                     retention_days,
@@ -497,16 +500,23 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                             f"pixiv_search_illust 跳过图片下载失败结果: {getattr(illust, 'id', 'unknown')}"
                         )
                         continue
-                    try:
-                        await event.send(result)
-                    except Exception as e:
-                        if not is_send_timeout_after_accept(e):
-                            raise
-                        logger.warning(
-                            "pixiv_search_illust 作品 %s 的发送回执超时，"
-                            "服务端已经受理，按发送成功处理。",
-                            getattr(illust, "id", "unknown"),
+                    outcome = await guarded_send(
+                        str(getattr(event, "unified_msg_origin", "") or ""),
+                        [int(illust.id)],
+                        lambda: event.send(result),
+                    )
+                    if outcome.status == "blocked" and outcome.error is not None:
+                        return (
+                            f"已确认发送 {sent_count} 张图片；发送记录无法写入，"
+                            "本条图片未开始发送。请检查存储后重试。"
                         )
+                    if outcome.status in {"unknown", "blocked"}:
+                        return (
+                            f"已确认发送 {sent_count} 张图片；另有发送结果待核实，"
+                            "已停止本次发送，不能自动重试。请管理员使用 /pixiv 待核实 查看。"
+                        )
+                    if outcome.status == "failed":
+                        raise outcome.error or RuntimeError("图片发送失败")
                     if chat_id:
                         await self._record_sent_illust(illust.id, chat_id)
                     sent_count += 1
@@ -613,6 +623,47 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             chat_id,
             retention_days,
         )
+
+    async def _partition_delivery_history(self, event, illusts, chat_id, retention_days):
+        unsent, recent = await self._partition_cached_illusts(illusts, chat_id, retention_days)
+        ids = [int(item.id) for item in illusts]
+        if not ids:
+            return unsent, recent
+        rows = await delivery_status(str(event.unified_msg_origin), ids)
+        unresolved = {key for key, row in rows.items() if row["state"] in {"pending", "unknown"}}
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        confirmed = {
+            key for key, row in rows.items()
+            if row["state"] == "sent" and datetime.fromisoformat(row["updated_at"]) >= cutoff
+        }
+        restored = [item for item in unsent if item.id in confirmed]
+        recent = [item for item in recent if item.id not in unresolved] + restored
+        times = await self._cached_sent_times([item.id for item in recent], chat_id)
+        for item in recent:
+            row = rows.get(item.id)
+            if row and row["state"] == "sent":
+                receipt_time = datetime.fromisoformat(row["updated_at"])
+                times[item.id] = max(times.get(item.id, receipt_time), receipt_time)
+        recent.sort(key=lambda item: times.get(item.id, datetime.min.replace(tzinfo=timezone.utc)))
+        return (
+            [item for item in unsent if item.id not in unresolved | confirmed],
+            recent,
+        )
+
+    async def _cached_sent_times(self, ids, chat_id):
+        if not ids:
+            return {}
+        from .database import SentIllust
+
+        def read():
+            return {
+                row.illust_id: row.sent_at.astimezone(timezone.utc)
+                for row in SentIllust.select(SentIllust.illust_id, SentIllust.sent_at).where(
+                    (SentIllust.chat_id == chat_id) & SentIllust.illust_id.in_(ids)
+                )
+            }
+
+        return await asyncio.to_thread(read)
 
     async def _record_sent_illust(self, illust_id: int, chat_id: str) -> None:
         from .database import add_sent_illust

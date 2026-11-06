@@ -11,6 +11,7 @@ from ..utils.pixiv_utils import (
 
 from .database import get_all_subscriptions, update_last_notified_id
 from .tag import build_detail_message
+from .delivery_guard import delivery_status, guarded_send, unresolved_deliveries
 
 
 class SubscriptionService:
@@ -91,6 +92,17 @@ class SubscriptionService:
 
     async def check_artist_updates(self, sub, illusts=None):
         """按当前订阅的游标处理作品；直接调用时仍独立查询。"""
+        if getattr(sub, "session_id", None):
+            try:
+                unresolved = await unresolved_deliveries(sub.session_id)
+            except Exception as error:
+                logger.error(f"订阅投递账本读取失败，保留游标: {error}")
+                return
+            # The API only returns its latest window. Missing uncertain IDs must
+            # not be skipped; conservatively pause all affected session cursors.
+            if any(row["illust_id"] > sub.last_notified_illust_id for row in unresolved):
+                logger.warning(f"订阅会话 {sub.session_id} 存在未决投递，保留游标等待核实")
+                return
         if illusts is None:
             illusts = await self.fetch_artist_illusts(sub.target_id)
 
@@ -104,6 +116,23 @@ class SubscriptionService:
         if new_illusts:
             new_illusts.reverse()
             for illust in new_illusts:
+                # Resolve uncertainty before filtering: changed exclusions must not
+                # skip an unresolved item and advance later cursors past it.
+                if getattr(sub, "session_id", None):
+                    try:
+                        rows = await delivery_status(sub.session_id, [illust.id])
+                    except Exception as error:
+                        logger.error(f"订阅投递账本读取失败，保留游标: {error}")
+                        break
+                    row = rows.get(illust.id)
+                    if row and row["state"] in ("pending", "unknown"):
+                        logger.warning(f"订阅作品 {illust.id} 投递待核实，保留游标并停止本批次")
+                        break
+                    if row and row["state"] == "sent":
+                        update_last_notified_id(
+                            sub.chat_id, sub.sub_type, sub.target_id, illust.id
+                        )
+                        continue
                 filtered_illusts, _ = filter_items(
                     [illust],
                     f"画师订阅: {sub.target_name}",
@@ -118,7 +147,7 @@ class SubscriptionService:
                     else:
                         logger.warning(
                             f"订阅发送失败，保留 last_notified_illust_id 不变，"
-                            f"下次将重试。artist={sub.target_id}, illust={illust.id}"
+                            f"明确失败下次重试，未决投递需核实。artist={sub.target_id}, illust={illust.id}"
                         )
                         break
                 else:
@@ -131,6 +160,12 @@ class SubscriptionService:
         """发送更新通知，返回图片是否发送成功。"""
         image_sent = False
         try:
+            rows = await delivery_status(sub.session_id, [illust.id])
+            row = rows.get(illust.id)
+            if row and row["state"] == "sent":
+                return True
+            if row and row["state"] in ("pending", "unknown"):
+                return False
             # 导入 MessageChain 类
             from astrbot.core.message.message_event_result import MessageChain
             from astrbot.api.message_components import Image, Node, Nodes
@@ -181,12 +216,23 @@ class SubscriptionService:
                             forward_chain = mock_event.chain_result(
                                 [Nodes(nodes=[Node(name="Pixiv订阅", content=node_content)])]
                             )
-                            await self.context.send_message(session_id_str, forward_chain)
+                            outgoing = forward_chain
                         else:
-                            await self.context.send_message(session_id_str, message_content)
+                            outgoing = message_content
+                        outcome = await guarded_send(
+                            session_id_str, [illust.id],
+                            lambda: self.context.send_message(session_id_str, outgoing),
+                            reject_sent=True,
+                        )
+                        if outcome.status != "sent":
+                            logger.warning(f"订阅作品 {illust.id} 发送结果为 {outcome.status}，保留游标")
+                            return False
                         image_sent = True
                     finally:
-                        await cleanup_pixiv_temp_files(message_content)
+                        try:
+                            await cleanup_pixiv_temp_files(message_content)
+                        except Exception as error:
+                            logger.warning(f"订阅临时文件清理失败: {error}")
             return image_sent
 
         except Exception as e:

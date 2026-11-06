@@ -117,6 +117,40 @@ class RandomSearchExecutionClaim(BaseModel):
     expires_at = pw.DateTimeField()
 
 
+def list_unresolved_deliveries(session_id: str) -> list[dict]:
+    """List only this exact unified session's pending/unknown sends; errors propagate."""
+    from .delivery_guard import get_delivery_ledger
+
+    return get_delivery_ledger().unresolved(session_id)
+
+
+def resolve_delivery(session_id: str, illust_id: int, delivered: bool) -> bool:
+    """Explicit admin reconciliation, never an automatic retry/retention operation.
+
+    Unknown is resolvable immediately; pending requires 24h and an operator-enforced
+    interval without active sends. Sent preserves confirmed cursor recovery; failed
+    permits retry. The CAS token prevents stale callbacks from changing this result.
+    """
+    from .delivery_guard import get_delivery_ledger
+
+    if not isinstance(delivered, bool):
+        return False
+    ledger = get_delivery_ledger()
+    rows = ledger.status(session_id, [illust_id])
+    row = rows.get(illust_id)
+    if row is None:
+        return False
+    try:
+        ledger.reconcile(
+            session_id, [illust_id], row["attempt_token"],
+            "sent" if delivered else "failed",
+            "Admin confirmed delivery" if delivered else "Admin authorized resend after verification",
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def _coerce_schedule_time(value, chat_id: str = ""):
     """将数据库中的调度时间统一转换为 datetime。"""
     if value is None:

@@ -5,7 +5,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +37,11 @@ def import_stubs():
             "astrbot.api.star", Context=object, Star=object, StarTools=object
         ),
         "astrbot.api.all": module(
-            "astrbot.api.all", command=lambda name: lambda function: function
+            "astrbot.api.all", command=lambda name: lambda function: function,
+            regex=lambda pattern: lambda function: function,
+        ),
+        "astrbot.api.message_components": module(
+            "astrbot.api.message_components", Reply=type("Reply", (), {})
         ),
         "aiohttp": module("aiohttp"),
     }
@@ -48,6 +52,7 @@ def import_stubs():
             "init_pixiv_utils": Mock(),
             "send_pixiv_image": Mock(),
             "send_forward_message": Mock(),
+            "cleanup_pixiv_temp_files": AsyncMock(),
         },
         "utils.help": {
             "init_help_manager": Mock(),
@@ -170,6 +175,39 @@ class ChatCommandsTest(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(alias=alias, artist=artist):
                     parsed = self.commands.parse_chat_command(f"{alias} {artist}")
                     self.assertEqual((parsed.action, parsed.argument), (action, "123"))
+
+    def test_quote_commands_and_request_only_counts(self):
+        parse = self.commands.parse_chat_command
+        for tail, action, count in (
+            ("查询作者", "quote_author", None),
+            ("订阅画师", "quote_subscribe", None),
+            ("再来几张", "quote_more", 3),
+            ("再来几张 1", "quote_more", 1),
+            ("再来几张 10张", "quote_more", 10),
+        ):
+            with self.subTest(tail=tail):
+                request = parse(tail)
+                self.assertEqual((request.action, request.count), (action, count))
+                self.assertEqual(request.argument, "")
+        for tail in ("查询作者 123", "订阅画师 123", "再来几张 0", "再来几张 11张",
+                     "再来几张 -1", "再来几张 1.5", "再来几张 2 3", "再来几张 abc"):
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                parse(tail)
+        for tail in ("查询作者风景", "订阅画师风景", "再来几张风景", "foo 查询作者"):
+            self.assertEqual(parse(tail).action, "legacy")
+
+    def test_delivery_reconciliation_commands_are_strict(self):
+        parse = self.commands.parse_chat_command
+        self.assertEqual(parse("待核实").action, "delivery_status")
+        for alias, action in (("确认送达", "delivery_confirm"), ("允许重发", "delivery_retry")):
+            for value in ("1", "123", str(2**63 - 1)):
+                with self.subTest(alias=alias, value=value):
+                    self.assertEqual(parse(f"{alias} {value}"), self.commands.ChatCommand(action, value))
+            for value in ("", "0", "-1", "True", "1.5", "123 extra", str(2**63), "9" * 100):
+                with self.subTest(alias=alias, value=value), self.assertRaises(ValueError):
+                    parse(f"{alias} {value}")
+        with self.assertRaises(ValueError):
+            parse("待核实 extra")
 
     def test_parser_rejects_malformed_commands(self):
         invalid = (
@@ -297,6 +335,106 @@ class ChatCommandsTest(unittest.IsolatedAsyncioTestCase):
         event.message = "pixiv 订阅 456"
         self.assertEqual([r async for r in self.plugin.pixiv_search_illust(event, "订阅")], ["added"])
         self.assertEqual(calls, ["123", "456"])
+
+    async def test_quote_routes_author_subscription_and_more_without_tag_search(self):
+        work = types.SimpleNamespace(id=123, user=types.SimpleNamespace(id=8, name="API author"))
+        calls = []
+
+        async def more(handler, event, resolved, count):
+            calls.append((resolved.id, count))
+            yield "more delivered through guarded pipeline"
+
+        async def subscribe(event, artist):
+            calls.append(artist)
+            yield "subscribed"
+
+        self.plugin.subscribe_handler = types.SimpleNamespace(pixiv_subscribe_add=subscribe)
+        with patch.object(self.main.QuoteHandler, "resolve", AsyncMock(return_value=work)) as resolve, \
+             patch.object(self.main.QuoteHandler, "more", more):
+            result = await self.route("查询作者")
+            self.assertIn("API author", result[0])
+            self.assertIn("https://www.pixiv.net/users/8", result[0])
+            self.assertEqual(await self.route("再来几张"), ["more delivered through guarded pipeline"])
+            self.assertEqual(await self.route("再来几张 10张"), ["more delivered through guarded pipeline"])
+            resolve.reset_mock()
+            self.assertIn("管理员", (await self.route("订阅画师"))[0])
+            resolve.assert_not_awaited()
+            self.assertEqual(calls, [(123, 3), (123, 10)])
+            event = FakeEvent("/pixiv 订阅画师")
+            event.is_admin = lambda: True
+            self.assertEqual([result async for result in self.plugin.pixiv_search_illust(event)], ["subscribed"])
+            self.assertEqual(calls[-1], "8")
+        self.assertEqual(self.api_calls, [])
+
+    async def test_delivery_commands_route_to_existing_guarded_handler(self):
+        calls = []
+
+        async def handle(event, action, argument=""):
+            calls.append((action, argument))
+            yield "existing admin handler"
+
+        name = f"{PACKAGE}.handlers.delivery"
+        with patch.dict(sys.modules, {name: module(name, handle_delivery_command=handle)}):
+            for tail in ("待核实", "确认送达 123", "允许重发 456"):
+                self.assertEqual(await self.route(tail), ["existing admin handler"])
+        self.assertEqual(calls, [("delivery_status", ""), ("delivery_confirm", "123"), ("delivery_retry", "456")])
+
+    async def test_bare_quote_sends_once_then_yields_only_none_with_final_stop(self):
+        reply_type = sys.modules["astrbot.api.message_components"].Reply
+        event = FakeEvent("查询作者")
+        event.get_platform_name = lambda: "aiocqhttp"
+        event.get_messages = lambda: [reply_type()]
+        event.result = None
+        event.set_result = lambda value: setattr(event, "result", value)
+        event.stop_event = lambda: event.set_result(types.SimpleNamespace(stopped=True))
+        event.send = AsyncMock(return_value=None)
+
+        async def action(event, request):
+            self.assertEqual(request.action, "quote_author")
+            yield "author details"
+
+        with patch.object(self.plugin, "_handle_pixiv_quote", action):
+            values = [value async for value in self.plugin.pixiv_quote_phrase(event)]
+        self.assertEqual(values, [None])
+        event.send.assert_awaited_once_with("author details")
+        self.assertTrue(event.result.stopped)
+        # Core call_handler only replaces event results for non-None message results.
+        self.assertTrue(all(value is None for value in values))
+
+    async def test_bare_phrase_leaves_unquoted_private_and_unsupported_events_untouched(self):
+        reply_type = sys.modules["astrbot.api.message_components"].Reply
+        for platform, group, replies in (("other", "100", [reply_type()]),
+                                          ("aiocqhttp", "", [reply_type()]),
+                                          ("aiocqhttp", "100", [])):
+            event = FakeEvent("查询作者")
+            event.get_platform_name = lambda: platform
+            event.get_group_id = lambda: group
+            event.get_messages = lambda: replies
+            event.stop_event = Mock()
+            event.send = AsyncMock()
+            self.assertEqual([value async for value in self.plugin.pixiv_quote_phrase(event)], [])
+            event.send.assert_not_awaited()
+            event.stop_event.assert_not_called()
+
+    async def test_actual_core_regex_only_matches_complete_quote_phrases(self):
+        source = ROOT.parent / "AstrBot/astrbot/core/star/filter/regex.py"
+        if not source.is_file():
+            self.skipTest("Adjacent AstrBot source is not available")
+        name = "quote_regex_core_test"
+        stubs = {
+            "astrbot.core.config": module("astrbot.core.config", AstrBotConfig=object),
+            "astrbot.core.platform.astr_message_event": module("astrbot.core.platform.astr_message_event", AstrMessageEvent=object),
+            name: module(name, HandlerFilter=object, __path__=[]),
+        }
+        with patch.dict(sys.modules, stubs):
+            spec = importlib.util.spec_from_file_location(f"{name}.regex", source)
+            core = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(core)
+            regex_filter = core.RegexFilter(self.commands.QUOTE_BARE_PATTERN)
+            for phrase in ("查询作者", "订阅画师", "再来几张", "再来几张 10张"):
+                self.assertTrue(regex_filter.filter(FakeEvent(phrase), {}))
+            for phrase in ("帮我查询作者", "查询作者 foo", "/pixiv 查询作者", "再来几张风景", "hello\n查询作者"):
+                self.assertFalse(regex_filter.filter(FakeEvent(phrase), {}))
 
     async def test_help_lists_short_commands_without_pixiv_authentication(self):
         self.plugin.client_wrapper.authenticate = Mock(side_effect=AssertionError)

@@ -46,6 +46,7 @@ from .random_empty_retry import (
 from .group_send_lock import get_group_send_lock, get_group_send_lock_registry
 from .random_schedule import normalize_schedule_time
 from .random_group_config import resolve_random_search_runtime_config
+from .delivery_guard import guarded_send, recent_sent_illust_ids
 
 
 @dataclass
@@ -60,6 +61,11 @@ class RandomSearchExecutionResult:
 class RandomIllustDeliveryResult:
     illust_ids: frozenset[int] = frozenset()
     image_count: int = 0
+    stop_delivery: bool = False
+
+
+class _RandomDeliveryUnresolved(Exception):
+    """Stop retry and candidate/source fallback after ambiguous delivery."""
 
 
 class RandomSearchService:
@@ -280,6 +286,11 @@ class RandomSearchService:
         """判断 QQ sendMsg 是否在受理后等待消息更新回执超时。"""
         return is_send_timeout_after_accept(error)
 
+    def _sent_retention_days(self):
+        return getattr(
+            getattr(self, "pixiv_config", None), "random_sent_illust_retention_days", 7
+        )
+
     async def _send_message_with_attempt_record(
         self,
         chat_id: str,
@@ -298,30 +309,25 @@ class RandomSearchService:
         illust_ids = list(related_illust_ids or [])
         attempt_illust_ids = illust_ids or [None]
 
-        try:
+        async def transport():
             if hasattr(message_content, "chain"):
-                await self.context.send_message(session_id, message_content)
+                return await self.context.send_message(session_id, message_content)
             elif isinstance(message_content, MessageChain):
-                await self.context.send_message(session_id, message_content)
+                return await self.context.send_message(session_id, message_content)
             elif isinstance(message_content, list):
                 raise TypeError("random_search 收到 list 类型消息内容，无法发送")
             else:
                 chain = MessageChain().message(str(message_content))
-                await self.context.send_message(session_id, chain)
+                return await self.context.send_message(session_id, chain)
 
-            for illust_id in attempt_illust_ids:
-                await self._record_random_search_send_attempt(
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    source_type=source_type,
-                    source_name=source_name,
-                    illust_id=illust_id,
-                    success=True,
-                )
-            logger.info(success_log)
-            return set(illust_ids)
-        except Exception as e:
-            if self._is_send_timeout_after_accept(e):
+        try:
+            outcome = await guarded_send(
+                session_id, illust_ids, transport,
+                sent_retention_days=self._sent_retention_days(),
+            )
+            success = outcome.status == "sent"
+            # Attempt history is observability, not the durable delivery gate.
+            try:
                 for illust_id in attempt_illust_ids:
                     await self._record_random_search_send_attempt(
                         chat_id=chat_id,
@@ -329,27 +335,27 @@ class RandomSearchService:
                         source_type=source_type,
                         source_name=source_name,
                         illust_id=illust_id,
-                        success=True,
+                        success=success,
+                        error_message=(
+                            None if success
+                            else f"{outcome.status}: {outcome.error or 'unresolved delivery'}"
+                        ),
                     )
-                logger.warning(
-                    f"{failure_log}: QQ sendMsg 已受理但等待消息更新回执超时，按已发送处理: {e}"
-                )
+            except Exception as error:
+                logger.error(f"随机推送尝试日志写入失败: {error}")
+            if success:
+                logger.info(success_log)
                 return set(illust_ids)
-
-            for illust_id in attempt_illust_ids:
-                await self._record_random_search_send_attempt(
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    source_type=source_type,
-                    source_name=source_name,
-                    illust_id=illust_id,
-                    success=False,
-                    error_message=str(e),
-                )
-            logger.error(f"{failure_log}: {e}")
+            if outcome.status in ("unknown", "blocked"):
+                logger.warning(f"{failure_log}: {outcome.status}，停止自动补发，需核实投递状态")
+                raise _RandomDeliveryUnresolved(outcome.status)
+            logger.error(f"{failure_log}: {outcome.error}")
             return set()
         finally:
-            await cleanup_pixiv_temp_files(message_content)
+            try:
+                await cleanup_pixiv_temp_files(message_content)
+            except Exception as error:
+                logger.warning(f"随机推送临时文件清理失败: {error}")
 
     async def _record_random_search_send_attempt(self, **kwargs):
         await asyncio.to_thread(add_random_search_send_attempt, **kwargs)
@@ -444,6 +450,8 @@ class RandomSearchService:
                             self.RANDOM_IMAGE_SEND_RETRIES,
                         )
                     )
+            except _RandomDeliveryUnresolved:
+                return RandomIllustDeliveryResult(stop_delivery=True)
             except Exception as e:
                 logger.warning(
                     "随机推送处理作品 %s 第 %s/%s 次尝试异常: %s"
@@ -506,6 +514,22 @@ class RandomSearchService:
             return RandomSearchExecutionResult(had_sendable_candidates=False)
 
         candidates = list(filtered_illusts)
+        candidate_ids = [self._get_illust_id(item) for item in candidates]
+        candidate_ids = [value for value in candidate_ids if value is not None]
+        if candidate_ids:
+            try:
+                recent_ids = await recent_sent_illust_ids(
+                    session_id, candidate_ids, self._sent_retention_days()
+                )
+            except Exception as error:
+                logger.error(f"随机推送投递账本读取失败，停止本次推送: {error}")
+                return RandomSearchExecutionResult(completed=False)
+            candidates = [
+                item for item in candidates
+                if self._get_illust_id(item) not in recent_ids
+            ]
+        if not candidates:
+            return RandomSearchExecutionResult(had_sendable_candidates=False)
         random.shuffle(candidates)
 
         try:
@@ -520,6 +544,7 @@ class RandomSearchService:
         sent_illust_ids = set()
         sent_image_count = 0
         consecutive_failures = 0
+        stopped = False
 
         for illust in candidates:
             if sent_image_count >= target_count:
@@ -533,6 +558,9 @@ class RandomSearchService:
                 illust=illust,
                 config=config,
             )
+            if delivery.stop_delivery:
+                stopped = True
+                break
             if delivery.illust_ids:
                 new_sent_ids = set(delivery.illust_ids) - sent_illust_ids
                 for illust_id in new_sent_ids:
@@ -559,6 +587,7 @@ class RandomSearchService:
             logger.info(f"群组 {chat_id}: 已记录 {len(sent_illust_ids)} 个作品的发送记录")
 
         return RandomSearchExecutionResult(
+            completed=not stopped,
             had_sendable_candidates=True,
             sent_count=len(sent_illust_ids),
             sent_image_count=sent_image_count,

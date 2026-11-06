@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 import unittest
+import tempfile
 from pathlib import Path
 
 
@@ -236,6 +237,7 @@ class FakeEvent:
     ):
         self.sent = []
         self.group_id = group_id
+        self.unified_msg_origin = f"test:GroupMessage:{group_id}" if group_id else "test:FriendMessage:user"
         self.fail_send = fail_send
         self.fail_send_for = set(fail_send_for or [])
         self.accept_timeout_for = set(accept_timeout_for or [])
@@ -245,7 +247,7 @@ class FakeEvent:
 
     async def send(self, result):
         if self.fail_send or getattr(result, "illust_id", None) in self.fail_send_for:
-            raise RuntimeError("send failed")
+            raise RuntimeError("rich media transfer failed")
         self.sent.append(result)
         if getattr(result, "illust_id", None) in self.accept_timeout_for:
             raise AcceptedSendTimeout(self.message if hasattr(self, "message") else "")
@@ -302,9 +304,24 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.original_logger = self.llm_tool.logger
         self.fake_logger = FakeLogger()
         self.llm_tool.logger = self.fake_logger
+        from utils import delivery_guard
+        self.delivery_guard = delivery_guard
+        self.delivery_temp = tempfile.TemporaryDirectory()
+        self.ledger = delivery_guard.DeliveryLedger(Path(self.delivery_temp.name) / "delivery.db")
+        self.original_ledger_getter = delivery_guard.get_delivery_ledger
+        delivery_guard.get_delivery_ledger = lambda: self.ledger
+        self.original_cached_times = self.llm_tool.PixivIllustSearchTool._cached_sent_times
+
+        async def empty_times(tool, ids, chat_id):
+            return {}
+
+        self.llm_tool.PixivIllustSearchTool._cached_sent_times = empty_times
 
     def tearDown(self):
         self.llm_tool.logger = self.original_logger
+        self.delivery_guard.get_delivery_ledger = self.original_ledger_getter
+        self.llm_tool.PixivIllustSearchTool._cached_sent_times = self.original_cached_times
+        self.delivery_temp.cleanup()
 
     def test_illust_tool_schema_accepts_agent_arguments(self):
         tool = self.llm_tool.PixivIllustSearchTool()
@@ -702,6 +719,148 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "已发送 1 张图片")
         self.assertEqual([item.illust_id for item in event.sent], [71])
         self.assertEqual(recorded, [(71, "group-1")])
+
+    async def test_unknown_timeout_stops_fallback_and_blocks_later_invocation(self):
+        from unittest.mock import patch
+
+        event = FakeEvent(group_id="group-1")
+        calls = []
+
+        async def timeout_send(result):
+            calls.append(result.illust_id)
+            raise TimeoutError("WebSocket API call timeout")
+
+        event.send = timeout_send
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(), pixiv_config=FakePixivConfig(),
+        )
+        recorded = []
+
+        async def record(illust_id, chat_id):
+            recorded.append(illust_id)
+
+        async def images(*args, **kwargs):
+            yield types.SimpleNamespace(illust_id=args[2].id)
+
+        tool._record_sent_illust = record
+        with patch.object(self.llm_tool, "send_pixiv_image", images):
+            for _ in range(2):
+                result = await tool._send_pixiv_result(
+                    event, [FakeIllust(71), FakeIllust(72)], "query", "query", count=2,
+                    chat_id="group-1",
+                )
+                self.assertIn("待核实", result)
+        self.assertEqual(calls, [71])
+        self.assertEqual(recorded, [])
+        self.assertEqual(self.ledger.status(event.unified_msg_origin, [71])[71]["state"], "unknown")
+
+    async def test_admin_confirmed_delivery_prefers_other_unsent_candidate(self):
+        from astrbot.core.agent.run_context import ContextWrapper
+        from unittest.mock import patch
+
+        event = FakeEvent(group_id="group-1")
+        token, _ = self.ledger.begin(event.unified_msg_origin, [1])
+        self.ledger.finish(event.unified_msg_origin, [1], token, "unknown")
+        self.ledger.reconcile(event.unified_msg_origin, [1], token, "sent", "confirmed in chat")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(), pixiv_config=FakePixivConfig(),
+        )
+
+        async def empty_cache(items, chat_id, days):
+            return list(items), []
+
+        async def record(*args):
+            pass
+
+        async def images(*args, **kwargs):
+            yield types.SimpleNamespace(illust_id=args[2].id)
+
+        tool._partition_cached_illusts = empty_cache
+        tool._record_sent_illust = record
+        with patch.object(self.llm_tool, "send_pixiv_image", images):
+            result = await tool.call(ContextWrapper(FakeAgentContext(event)), query="Atlanta(艦隊これくしょん)", count=1)
+        self.assertEqual(result, "已发送 1 张图片")
+        self.assertEqual([item.illust_id for item in event.sent], [2])
+
+    async def test_storage_block_reports_no_transport_not_unknown_delivery(self):
+        from unittest.mock import patch
+
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool(
+            pixiv_client=FakePixivClient(), pixiv_config=FakePixivConfig(),
+        )
+
+        async def images(*args, **kwargs):
+            yield types.SimpleNamespace(illust_id=args[2].id)
+
+        with patch.object(self.ledger, "begin", side_effect=OSError("disk")), \
+             patch.object(self.llm_tool, "send_pixiv_image", images):
+            result = await tool._send_pixiv_result(event, [FakeIllust(1)], "query", "query")
+        self.assertIn("未开始发送", result)
+        self.assertNotIn("待核实", result)
+        self.assertEqual(event.sent, [])
+
+    async def test_mixed_confirmed_and_cached_history_uses_oldest_effective_send_time(self):
+        import sqlite3
+        from contextlib import closing
+        from datetime import datetime, timedelta, timezone
+
+        event = FakeEvent(group_id="group-1")
+        tool = self.llm_tool.PixivIllustSearchTool()
+        older = datetime.now(timezone.utc) - timedelta(days=2)
+        newer = datetime.now(timezone.utc) - timedelta(days=1)
+        token, _ = self.ledger.begin(event.unified_msg_origin, [1])
+        self.ledger.finish(event.unified_msg_origin, [1], token, "sent")
+        with closing(sqlite3.connect(self.ledger.path)) as db, db:
+            db.execute("UPDATE delivery_uncertainty SET updated_at=?", (older.isoformat(),))
+
+        async def partition(items, chat_id, days):
+            return [items[0]], [items[1]]
+
+        async def times(ids, chat_id):
+            return {2: newer}
+
+        tool._partition_cached_illusts = partition
+        tool._cached_sent_times = times
+        unsent, recent = await tool._partition_delivery_history(
+            event, [FakeIllust(1), FakeIllust(2)], "group-1", 45,
+        )
+        self.assertEqual(unsent, [])
+        self.assertEqual([item.id for item in recent], [1, 2])
+
+    async def test_cached_send_times_read_real_database_with_chat_and_id_scope(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        import peewee as pw
+
+        database = pw.SqliteDatabase(str(Path(self.delivery_temp.name) / "cache.db"))
+
+        class SentIllust(pw.Model):
+            illust_id = pw.BigIntegerField()
+            chat_id = pw.TextField()
+            sent_at = pw.DateTimeField()
+
+            class Meta:
+                pass
+
+        SentIllust.bind(database)
+        database.create_tables([SentIllust])
+        timestamp = datetime(2026, 11, 6, 12, 0)
+        SentIllust.insert_many([
+            {"illust_id": 1, "chat_id": "group-1", "sent_at": timestamp},
+            {"illust_id": 2, "chat_id": "other", "sent_at": timestamp},
+            {"illust_id": 3, "chat_id": "group-1", "sent_at": timestamp},
+        ]).execute()
+        stub = types.ModuleType("utils.database")
+        stub.SentIllust = SentIllust
+        try:
+            with patch.dict(sys.modules, {"utils.database": stub}):
+                result = await self.original_cached_times(
+                    self.llm_tool.PixivIllustSearchTool(), [1, 2], "group-1"
+                )
+            self.assertEqual(result, {1: timestamp.astimezone(timezone.utc)})
+        finally:
+            database.close()
 
     async def test_duplicate_ids_are_sent_and_recorded_once(self):
         event = FakeEvent(group_id="group-1")

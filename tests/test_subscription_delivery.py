@@ -1,8 +1,11 @@
 import asyncio
+import functools
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -150,6 +153,15 @@ def load_subscription_module():
     subscription = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = subscription
     spec.loader.exec_module(subscription)
+    # Real durable state must be isolated even though these fixtures reuse IDs.
+    from utils.delivery_guard import DeliveryLedger, guarded_send, delivery_status, unresolved_deliveries
+
+    subscription._test_delivery_temp = tempfile.TemporaryDirectory()
+    weakref.finalize(subscription, subscription._test_delivery_temp.cleanup)
+    ledger = DeliveryLedger(Path(subscription._test_delivery_temp.name) / "delivery.db")
+    subscription.guarded_send = functools.partial(guarded_send, ledger=ledger)
+    subscription.delivery_status = functools.partial(delivery_status, ledger=ledger)
+    subscription.unresolved_deliveries = functools.partial(unresolved_deliveries, ledger=ledger)
     return subscription
 
 

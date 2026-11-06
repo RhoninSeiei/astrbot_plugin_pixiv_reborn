@@ -686,6 +686,8 @@ async def send_pixiv_image(
         details = f"{details}\n{work_id_line}".strip()
     if show_details and details:
         components.append(Plain(details))
+    elif not show_details:
+        components.append(Plain(f"作品ID: {illust.id}"))
     yield event.chain_result(components)
 
 
@@ -722,6 +724,8 @@ async def send_ugoira(
                 chain_content = [gif_comp]
                 if show_details and ugoira_info:
                     chain_content.append(Plain(ugoira_info))
+                elif not show_details:
+                    chain_content.append(Plain(f"作品ID: {illust.id}"))
                 yield event.chain_result(chain_content)
 
                 logger.info(f"Pixiv 插件：动图GIF发送完成 - ID: {illust.id}")
@@ -946,6 +950,8 @@ async def send_forward_message(
                         node_content = [gif_comp]
                         if _config.show_details and ugoira_info:
                             node_content.append(Plain(ugoira_info))
+                        elif not _config.show_details:
+                            node_content.append(Plain(f"作品ID: {img.id}"))
                     else:
                         node_content = [Plain("动图处理失败")]
                 else:
@@ -992,6 +998,8 @@ async def send_forward_message(
 
                     if _config.show_details:
                         node_content.append(Plain(detail_message))
+                    elif image_sent:
+                        node_content.append(Plain(f"作品ID: {img.id}"))
 
                 node = Node(name=nickname, content=node_content)
                 nodes_list.append(node)

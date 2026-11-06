@@ -6,7 +6,7 @@ import aiohttp
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
-from astrbot.api.all import command
+from astrbot.api.all import command, regex
 
 from .utils.database import initialize_database
 from .utils.subscription import SubscriptionService
@@ -19,8 +19,13 @@ from .utils.llm_tool import (
 from .utils.tag import set_filter_config_source
 
 from .utils.config import PixivConfig, PixivConfigManager
-from .utils.chat_commands import CHAT_HELP, extract_pixiv_tail, parse_chat_command
-from .utils.access_policy import require_management
+from .utils.chat_commands import (
+    CHAT_HELP,
+    QUOTE_BARE_PATTERN,
+    extract_pixiv_tail,
+    parse_chat_command,
+)
+from .utils.access_policy import can_manage_chat, require_management
 
 from .core.client import PixivClientWrapper
 from .handlers.illust import IllustHandler
@@ -30,6 +35,7 @@ from .handlers.subscribe import SubscribeHandler
 from .handlers.random_illust import RandomIllustHandler
 from .handlers.misc import MiscHandler
 from .handlers.fanbox import FanboxHandler
+from .handlers.quote import QuoteError, QuoteHandler, has_quote
 
 
 class PixivSearchPlugin(Star):
@@ -155,6 +161,18 @@ class PixivSearchPlugin(Star):
             yield event.plain_result(CHAT_HELP)
             return
 
+        if request.action.startswith("quote_"):
+            async for result in self._handle_pixiv_quote(event, request):
+                yield result
+            return
+
+        if request.action.startswith("delivery_"):
+            from .handlers.delivery import handle_delivery_command
+
+            async for result in handle_delivery_command(event, request.action, request.argument):
+                yield result
+            return
+
         methods = {
             "subscribe_add": self.pixiv_subscribe_add,
             "subscribe_remove": self.pixiv_subscribe_remove,
@@ -177,6 +195,54 @@ class PixivSearchPlugin(Star):
             handler = IllustHandler(self.client_wrapper, request_config)
         async for result in handler.pixiv_search_illust(event, request.argument):
             yield result
+
+    @regex(QUOTE_BARE_PATTERN)
+    async def pixiv_quote_phrase(self, event: AstrMessageEvent):
+        """Handle only exact bare reply phrases; ordinary conversation is untouched."""
+        if (
+            event.get_platform_name() != "aiocqhttp"
+            or not event.get_group_id()
+            or not has_quote(event)
+        ):
+            return
+        try:
+            try:
+                request = parse_chat_command(event.get_message_str().strip())
+            except ValueError as error:
+                await event.send(event.plain_result(str(error)))
+            else:
+                async for result in self._handle_pixiv_quote(event, request):
+                    await event.send(result)
+        except Exception:
+            logger.exception("Pixiv 引用短语响应失败，不自动重发。")
+        finally:
+            # Yielding a result replaces stop_event in core call_handler; send first.
+            event.stop_event()
+        yield None
+
+    async def _handle_pixiv_quote(self, event, request):
+        if request.action == "quote_subscribe" and not await can_manage_chat(event):
+            yield event.plain_result("仅机器人管理员、群主或群管理员可以管理本群 Pixiv 推送。")
+            return
+        handler = QuoteHandler(self.client_wrapper, self.pixiv_config)
+        try:
+            work = await handler.resolve(event)
+            if request.action == "quote_author":
+                yield event.plain_result(
+                    f"作品ID: {work.id}\n画师: {work.user.name}\n"
+                    f"画师ID: {work.user.id}\nhttps://www.pixiv.net/users/{work.user.id}"
+                )
+            elif request.action == "quote_subscribe":
+                async for result in self.pixiv_subscribe_add(event, str(work.user.id)):
+                    yield result
+            else:
+                async for result in handler.more(event, work, request.count):
+                    yield result
+        except QuoteError as error:
+            yield event.plain_result(str(error))
+        except Exception:
+            logger.exception("Pixiv 引用图片操作失败。")
+            yield event.plain_result("引用图片操作未完成，未确认送达的作品不会计为已发送，请稍后重试。")
 
     @command("pixiv_illust_new")
     async def pixiv_illust_new(

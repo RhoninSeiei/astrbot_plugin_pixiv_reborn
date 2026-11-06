@@ -349,6 +349,49 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([component.text for component in details], ["details"])
 
+    async def test_hidden_details_keep_only_work_id_for_reply_lookup(self):
+        results = [result async for result in self.pixiv_utils.send_pixiv_image(
+            object(), FakeEvent(), fake_illust(1), "private verbose details",
+            show_details=False,
+        )]
+        texts = [part.text for part in results[0].chain if isinstance(part, FakePlain)]
+        self.assertEqual(texts, ["作品ID: 148023016"])
+        self.assertTrue(any(isinstance(part, FakeImage) for part in results[0].chain))
+
+    async def test_hidden_ugoira_details_keep_work_id_for_reply_lookup(self):
+        from unittest.mock import AsyncMock, patch
+
+        with patch.object(self.pixiv_utils, "process_ugoira_for_content", AsyncMock(
+            return_value={"gif_data": b"GIF89a", "ugoira_info": "verbose details"}
+        )), patch.object(self.pixiv_utils, "_build_image_from_bytes", AsyncMock(
+            return_value=FakeImage(data=b"GIF89a")
+        )):
+            illust = fake_ugoira()
+            results = [result async for result in self.pixiv_utils.send_ugoira(
+                object(), FakeEvent(), illust, "details", show_details=False,
+            )]
+        texts = [part.text for part in results[0].chain if isinstance(part, FakePlain)]
+        self.assertEqual(texts, [f"作品ID: {illust.id}"])
+
+    async def test_hidden_forward_nodes_keep_per_work_identity(self):
+        from unittest.mock import AsyncMock, patch
+
+        self.pixiv_utils._config.show_details = False
+        with patch.object(self.pixiv_utils, "Node", types.SimpleNamespace), \
+             patch.object(self.pixiv_utils, "Nodes", types.SimpleNamespace), \
+             patch.object(self.pixiv_utils, "download_image", AsyncMock(return_value=b"image")), \
+             patch.object(self.pixiv_utils, "_build_image_from_bytes", AsyncMock(return_value=FakeImage(data=b"image"))), \
+             patch.object(self.pixiv_utils, "process_ugoira_for_content", AsyncMock(
+                 return_value={"gif_data": b"GIF89a", "ugoira_info": "verbose details"}
+             )):
+            results = [result async for result in self.pixiv_utils.send_forward_message(
+                object(), FakeEvent(), [fake_illust(1, 11), fake_ugoira(12)],
+                lambda illust: "verbose details", single_batch=True,
+            )]
+        nodes = results[0].chain[0].nodes
+        self.assertEqual([[part.text for part in node.content if isinstance(part, FakePlain)]
+                          for node in nodes], [["作品ID: 11"], ["作品ID: 12"]])
+
     async def test_ten_pages_yield_three_images_and_one_work_id(self):
         results = await self._collect_delivery(fake_illust(10))
 
