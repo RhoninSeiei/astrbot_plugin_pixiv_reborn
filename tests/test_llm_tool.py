@@ -322,11 +322,52 @@ class PixivIllustSearchToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("主 Pixiv tag", props["query"]["description"])
         self.assertIn("仅用于诊断", props["source_text"]["description"])
 
+    def test_llm_content_policy_cannot_override_config(self):
+        tool = self.llm_tool.PixivIllustSearchTool(pixiv_config=FakePixivConfig())
+        with self.assertRaises(ValueError):
+            tool._build_filter_config("tag", 1, "r18")
+        self.assertEqual(tool._build_filter_config("tag", 1, "safe").r18_mode, "过滤 R18")
+        novel = self.llm_tool.PixivNovelSearchTool(pixiv_config=FakePixivConfig())
+        safe = types.SimpleNamespace(x_restrict=0, tags=[])
+        adult = types.SimpleNamespace(x_restrict=1, tags=[])
+        self.assertEqual(novel._filter_novel_policy([adult, safe]), [safe])
+        with self.assertRaises(ValueError):
+            novel._filter_novel_policy([adult], "r18")
+
     def test_factory_returns_native_tools_without_handlers(self):
         tools = self.llm_tool.create_pixiv_llm_tools()
         self.assertIsInstance(tools[0], self.llm_tool.PixivIllustSearchTool)
         self.assertIsInstance(tools[1], self.llm_tool.PixivNovelSearchTool)
         self.assertTrue(all(tool.handler is None for tool in tools))
+
+    async def test_novel_call_enforces_policy_before_delivery_or_metadata(self):
+        from unittest.mock import AsyncMock, patch
+        for query in ("123", "tag"):
+            for has_event in (True, False):
+                config = FakePixivConfig()
+                item = types.SimpleNamespace(id=123, title="restricted-title", x_restrict=1, tags=[])
+                api = types.SimpleNamespace(
+                    novel_detail=lambda *a, **k: types.SimpleNamespace(novel=item),
+                    search_novel=lambda *a, **k: types.SimpleNamespace(novels=[item]),
+                )
+                tool = self.llm_tool.PixivNovelSearchTool(pixiv_client=api, pixiv_config=config)
+                context = types.SimpleNamespace(event=object() if has_event else None)
+                with patch.object(type(tool), "_send_novel_result", new_callable=AsyncMock) as send:
+                    result = await tool.call(context, query=query, filters="safe")
+                    send.assert_not_awaited()
+                    self.assertNotIn("restricted-title", result)
+                    config.r18_mode = "允许 R18"
+                    config.filter_r18g_only = True
+                    item.x_restrict = 2
+                    result = await tool.call(context, query=query, filters="r18")
+                    send.assert_not_awaited()
+                    self.assertNotIn("restricted-title", result)
+                    item.x_restrict = 1
+                    send.return_value = "delivered"
+                    result = await tool.call(context, query=query, filters="r18")
+                    if has_event:
+                        send.assert_awaited_once()
+                        self.assertEqual(result, "delivered")
 
     def test_llm_search_uses_shared_group_send_lock(self):
         from utils.group_send_lock import get_group_send_lock

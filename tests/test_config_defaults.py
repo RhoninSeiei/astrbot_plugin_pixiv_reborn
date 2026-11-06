@@ -69,7 +69,7 @@ class PixivConfigDefaultsTest(unittest.TestCase):
             manager.handle_config_command(None, "automatic_push_excluded_tags", None)
         )
         update_result = asyncio.run(
-            manager.handle_config_command(None, "automatic_push_excluded_tags", "")
+            manager.handle_config_command(types.SimpleNamespace(is_admin=lambda: True), "automatic_push_excluded_tags", "")
         )
 
         self.assertIn("automatic_push_excluded_tags 当前值", query_result)

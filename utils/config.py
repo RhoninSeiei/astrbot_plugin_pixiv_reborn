@@ -7,6 +7,7 @@ from typing import Dict, Any
 from dataclasses import dataclass
 
 from .tag import normalize_excluded_tags
+from .access_policy import is_bot_admin
 
 
 async def clean_temp_dir(temp_dir: Path, max_files: int = 20) -> None:
@@ -412,6 +413,8 @@ class PixivConfigManager:
 
         schema_item = self.schema[key]
         typ = schema_item["type"]
+        if key in {"refresh_token", "fanbox_cookie", "fanbox_sessid"}:
+            return False, "敏感配置请通过管理面板修改。"
 
         try:
             if typ == "enum":
@@ -484,6 +487,9 @@ class PixivConfigManager:
                 else:
                     setattr(self.config, key, value)
 
+            if key != "automatic_push_excluded_tags":
+                attribute = "refresh_interval" if key == "refresh_token_interval_minutes" else key
+                self.config.config[key] = getattr(self.config, attribute)
             self.config.save_config()
             # 获取实际设置的值
             if key == "refresh_token_interval_minutes":
@@ -559,6 +565,8 @@ class PixivConfigManager:
             return self.get_param_info(key)
 
         # 2参数：设置
+        if not is_bot_admin(event):
+            return "仅机器人管理员可以修改全局 Pixiv 配置。"
         value = args[1]
         success, message = self.validate_and_set_config(key, value)
 

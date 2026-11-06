@@ -1,6 +1,7 @@
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
 from ..utils.help import get_help_message
+from ..utils.access_policy import is_bot_admin
 
 
 class MiscHandler:
@@ -68,6 +69,9 @@ class MiscHandler:
             return
 
         # 验证设置参数
+        if not is_bot_admin(event):
+            yield event.plain_result("仅机器人管理员可以修改 Pixiv 账号偏好。")
+            return
         valid_settings = ["true", "false", "1", "0", "yes", "no", "on", "off"]
         if setting.lower() not in valid_settings:
             yield event.plain_result(

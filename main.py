@@ -1,4 +1,5 @@
 import asyncio
+from copy import copy
 from typing import Dict, Any
 import aiohttp
 
@@ -18,6 +19,8 @@ from .utils.llm_tool import (
 from .utils.tag import set_filter_config_source
 
 from .utils.config import PixivConfig, PixivConfigManager
+from .utils.chat_commands import CHAT_HELP, extract_pixiv_tail, parse_chat_command
+from .utils.access_policy import require_management
 
 from .core.client import PixivClientWrapper
 from .handlers.illust import IllustHandler
@@ -140,8 +143,39 @@ class PixivSearchPlugin(Star):
 
     @command("pixiv")
     async def pixiv_search_illust(self, event: AstrMessageEvent, tags: str = ""):
-        """处理 /pixiv 命令，默认为标签搜索功能"""
-        async for result in self.illust_handler.pixiv_search_illust(event, tags):
+        """处理 /pixiv 短命令，其他输入保留原标签搜索行为。"""
+        tail = extract_pixiv_tail(event.get_message_str(), tags)
+        try:
+            request = parse_chat_command(tail)
+        except ValueError as error:
+            yield event.plain_result(str(error))
+            return
+
+        if request.action == "help":
+            yield event.plain_result(CHAT_HELP)
+            return
+
+        methods = {
+            "subscribe_add": self.pixiv_subscribe_add,
+            "subscribe_remove": self.pixiv_subscribe_remove,
+            "subscribe_list": self.pixiv_subscribe_list,
+            "random_suspend": self.pixiv_random_suspend,
+            "random_resume": self.pixiv_random_resume,
+            "random_status": self.pixiv_random_status,
+        }
+        if request.action in methods:
+            # Call main methods so their management guards also cover short commands.
+            args = (request.argument,) if request.argument else ()
+            async for result in methods[request.action](event, *args):
+                yield result
+            return
+
+        handler = self.illust_handler
+        if request.count is not None:
+            request_config = copy(self.pixiv_config)
+            request_config.return_count = request.count
+            handler = IllustHandler(self.client_wrapper, request_config)
+        async for result in handler.pixiv_search_illust(event, request.argument):
             yield result
 
     @command("pixiv_illust_new")
@@ -285,6 +319,7 @@ class PixivSearchPlugin(Star):
     # ----订阅类
 
     @command("pixiv_subscribe_add")
+    @require_management
     async def pixiv_subscribe_add(self, event: AstrMessageEvent, artist_id: str = ""):
         """订阅画师"""
         async for result in self.subscribe_handler.pixiv_subscribe_add(
@@ -293,6 +328,7 @@ class PixivSearchPlugin(Star):
             yield result
 
     @command("pixiv_subscribe_remove")
+    @require_management
     async def pixiv_subscribe_remove(
         self, event: AstrMessageEvent, artist_id: str = ""
     ):
@@ -318,12 +354,14 @@ class PixivSearchPlugin(Star):
     # ----随机搜索类
 
     @command("pixiv_random_add")
+    @require_management
     async def pixiv_random_add(self, event: AstrMessageEvent, tags: str = ""):
         """添加随机搜索标签"""
         async for result in self.random_illust_handler.pixiv_random_add(event, tags):
             yield result
 
     @command("pixiv_random_del")
+    @require_management
     async def pixiv_random_del(self, event: AstrMessageEvent, index: str = ""):
         """删除随机搜索标签"""
         async for result in self.random_illust_handler.pixiv_random_del(event, index):
@@ -336,12 +374,14 @@ class PixivSearchPlugin(Star):
             yield result
 
     @command("pixiv_random_suspend")
+    @require_management
     async def pixiv_random_suspend(self, event: AstrMessageEvent):
         """暂停当前群聊的随机搜索功能"""
         async for result in self.random_illust_handler.pixiv_random_suspend(event):
             yield result
 
     @command("pixiv_random_resume")
+    @require_management
     async def pixiv_random_resume(self, event: AstrMessageEvent):
         """恢复当前群聊的随机搜索功能"""
         async for result in self.random_illust_handler.pixiv_random_resume(event):
@@ -354,12 +394,14 @@ class PixivSearchPlugin(Star):
             yield result
 
     @command("pixiv_random_force")
+    @require_management
     async def pixiv_random_force(self, event: AstrMessageEvent):
         """强制执行当前群聊的随机搜索（调试用）"""
         async for result in self.random_illust_handler.pixiv_random_force(event):
             yield result
 
     @command("pixiv_random_ranking_add")
+    @require_management
     async def pixiv_random_ranking_add(
         self, event: AstrMessageEvent, mode: str = "", date: str = ""
     ):
@@ -371,6 +413,7 @@ class PixivSearchPlugin(Star):
             yield result
 
     @command("pixiv_random_ranking_del")
+    @require_management
     async def pixiv_random_ranking_del(self, event: AstrMessageEvent, index: str = ""):
         """删除随机排行榜配置"""
         async for result in self.random_illust_handler.pixiv_random_ranking_del(

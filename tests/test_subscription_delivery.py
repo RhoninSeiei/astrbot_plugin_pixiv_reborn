@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 
 class FakeLogger:
@@ -167,6 +168,97 @@ def load_client_module():
 
 
 class SubscriptionDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_artist_fetch_preserves_independent_group_cursors(self):
+        subscription = load_subscription_module()
+        calls, attempts, updates = [], [], []
+        cursors = {"failed": 1, "healthy": 2}
+        fail_delivery = True
+
+        class Client:
+            def user_illusts(self, target_id):
+                calls.append(target_id)
+                return types.SimpleNamespace(
+                    illusts=[FakeIllust(4), FakeIllust(3), FakeIllust(2)]
+                )
+
+        def subscriptions():
+            return [types.SimpleNamespace(
+                sub_type="artist", target_id="123", target_name="artist",
+                chat_id=chat_id, last_notified_illust_id=cursor,
+            ) for chat_id, cursor in cursors.items()]
+
+        def save_cursor(chat_id, sub_type, target_id, illust_id):
+            cursors[chat_id] = illust_id
+            updates.append((chat_id, illust_id))
+
+        async def send(sub, illust):
+            attempts.append((sub.chat_id, illust.id))
+            return not (sub.chat_id == "failed" and fail_delivery)
+
+        service = object.__new__(subscription.SubscriptionService)
+        service.client = Client()
+        service.client_wrapper = DirectClientWrapper(service.client)
+        service.client_wrapper.authenticate = AsyncMock(return_value=True)
+        service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
+        service.send_update = send
+        with patch.object(subscription, "get_all_subscriptions", subscriptions), \
+             patch.object(subscription, "update_last_notified_id", save_cursor), \
+             patch.object(subscription.asyncio, "sleep", new=AsyncMock()):
+            await service.check_subscriptions()
+            self.assertEqual(calls, ["123"])
+            self.assertEqual(attempts, [("failed", 2), ("healthy", 3), ("healthy", 4)])
+            self.assertEqual(updates, [("healthy", 3), ("healthy", 4)])
+            self.assertEqual(cursors, {"failed": 1, "healthy": 4})
+            fail_delivery = False
+            await service.check_subscriptions()
+        self.assertEqual(calls, ["123", "123"])
+        self.assertEqual(attempts[3:], [("failed", 2), ("failed", 3), ("failed", 4)])
+        self.assertEqual(cursors, {"failed": 4, "healthy": 4})
+
+    async def test_group_exception_does_not_block_other_groups_or_artists(self):
+        subscription = load_subscription_module()
+        calls, attempts, updates = [], [], []
+
+        class Client:
+            def user_illusts(self, target_id):
+                calls.append(target_id)
+                if target_id == "unavailable":
+                    raise RuntimeError("lookup failed")
+                return types.SimpleNamespace(illusts=[FakeIllust(2)])
+
+        subs = [types.SimpleNamespace(
+            sub_type=sub_type, target_id=artist, target_name=artist,
+            chat_id=chat_id, last_notified_illust_id=1,
+        ) for chat_id, sub_type, artist in (
+            ("a", "artist", "unavailable"),
+            ("b", "artist", "unavailable"),
+            ("broken", "artist", "123"),
+            ("healthy", "artist", "123"),
+            ("other", "artist", "456"),
+            ("unsupported", "other", "123"),
+        )]
+
+        async def send(sub, illust):
+            attempts.append(sub.chat_id)
+            if sub.chat_id == "broken":
+                raise RuntimeError("group failure")
+            return True
+
+        service = object.__new__(subscription.SubscriptionService)
+        service.client = Client()
+        service.client_wrapper = DirectClientWrapper(service.client)
+        service.client_wrapper.authenticate = AsyncMock(return_value=True)
+        service.pixiv_config = types.SimpleNamespace(automatic_push_excluded_tags=[])
+        service.send_update = send
+        with patch.object(subscription, "get_all_subscriptions", return_value=subs), \
+             patch.object(subscription, "update_last_notified_id",
+                          side_effect=lambda *args: updates.append((args[0], args[-1]))), \
+             patch.object(subscription.asyncio, "sleep", new=AsyncMock()):
+            await service.check_subscriptions()
+        self.assertEqual(calls, ["unavailable", "123", "456"])
+        self.assertEqual(attempts, ["broken", "healthy", "other"])
+        self.assertEqual(updates, [("healthy", 2), ("other", 2)])
+
     async def test_artist_lookup_retries_ssl_eof_before_advancing_cursor(self):
         subscription = load_subscription_module()
         client_module = load_client_module()

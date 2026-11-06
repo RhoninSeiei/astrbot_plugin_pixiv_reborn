@@ -50,28 +50,52 @@ class SubscriptionService:
         if not subscriptions:
             return
 
+        grouped_subscriptions = {}
         for sub in subscriptions:
+            grouped_subscriptions.setdefault((sub.sub_type, sub.target_id), []).append(sub)
+
+        for (sub_type, target_id), subscribers in grouped_subscriptions.items():
+            if sub_type != "artist":
+                continue
             try:
-                if sub.sub_type == "artist":
-                    await self.check_artist_updates(sub)
+                illusts = await self.fetch_artist_illusts(target_id)
             except Exception as e:
                 logger.error(
-                    f"检查订阅 {sub.sub_type}: {sub.target_id} 时发生错误: {e}"
+                    f"检查订阅 {sub_type}: {target_id} 时发生错误: {e}"
                 )
+            else:
+                # Share the lookup, not delivery state: each chat keeps its own cursor.
+                for sub in subscribers:
+                    try:
+                        await self.check_artist_updates(sub, illusts)
+                    except Exception as e:
+                        logger.error(
+                            f"推送订阅 {sub_type}: {target_id} 到 {sub.chat_id} "
+                            f"时发生错误: {e}"
+                        )
             await asyncio.sleep(5)
 
-    async def check_artist_updates(self, sub):
-        """检查画师更新"""
+    async def fetch_artist_illusts(self, target_id):
+        """通过现有重试包装器获取画师作品，供各订阅共享。"""
         api: AppPixivAPI = self.client
         json_result = await self.client_wrapper.call_pixiv_api(
-            api.user_illusts, sub.target_id
+            api.user_illusts, target_id
         )
+        if (
+            json_result is None
+            or getattr(json_result, "error", None)
+            or not isinstance(getattr(json_result, "illusts", None), list)
+        ):
+            raise ValueError(f"画师 {target_id} 的作品查询未成功")
+        return json_result.illusts
 
-        if not json_result or not json_result.illusts:
-            return
+    async def check_artist_updates(self, sub, illusts=None):
+        """按当前订阅的游标处理作品；直接调用时仍独立查询。"""
+        if illusts is None:
+            illusts = await self.fetch_artist_illusts(sub.target_id)
 
         new_illusts = []
-        for illust in json_result.illusts:
+        for illust in illusts:
             if illust.id > sub.last_notified_illust_id:
                 new_illusts.append(illust)
             else:

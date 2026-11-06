@@ -18,6 +18,8 @@ from .tag import (
     FilterConfig,
     filter_illusts_with_reason,
     validate_and_process_tags,
+    is_r18,
+    is_r18g,
 )
 from .pixiv_utils import (
     send_pixiv_image,
@@ -28,6 +30,7 @@ from .random_empty_retry import (
     is_send_timeout_after_accept,
 )
 from .group_send_lock import get_group_send_lock
+from .access_policy import resolve_content_mode
 
 
 async def _call_pixiv_api(pixiv_client_wrapper, func, *args, **kwargs):
@@ -138,6 +141,7 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             source_text = str(kwargs.get("source_text", "") or "").strip()
             count = self._normalize_count(kwargs.get("count", 1))
             filters = self._normalize_filters(kwargs.get("filters", "safe"))
+            resolve_content_mode(getattr(self.pixiv_config, "r18_mode", "过滤 R18"), filters)
             tags = self._normalize_tags(kwargs.get("tags"))
             logger.info(
                 "ToolLoopAgentRunner 执行 pixiv_search_illust: "
@@ -524,7 +528,9 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         filters: str,
     ) -> FilterConfig:
         return FilterConfig(
-            r18_mode="仅 R18" if filters == "r18" else "过滤 R18",
+            r18_mode=resolve_content_mode(
+                getattr(self.pixiv_config, "r18_mode", "过滤 R18"), filters
+            ),
             filter_r18g_only=self.pixiv_config.filter_r18g_only
             if self.pixiv_config
             else False,
@@ -666,6 +672,10 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
     ) -> ToolExecResult:
         try:
             query = kwargs.get("query", "")
+            resolve_content_mode(
+                getattr(self.pixiv_config, "r18_mode", "过滤 R18"),
+                kwargs.get("filters", "safe"),
+            )
             logger.info(f"Pixiv小说搜索工具：搜索 '{query}'")
 
             if not self.pixiv_client:
@@ -682,14 +692,25 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
                 return "Pixiv API 认证失败，请检查配置中的凭据信息。"
 
             tags = query.strip()
-            return await self._search_novel(tags, query, context)
+            return await self._search_novel(tags, query, context, kwargs.get("filters", "safe"))
 
         except Exception as e:
             logger.error(f"Pixiv小说搜索失败: {e}")
             return f"搜索失败: {str(e)}"
 
-    async def _search_novel(self, tags, query, context):
+    def _filter_novel_policy(self, items, filters="safe"):
+        mode = resolve_content_mode(
+            getattr(self.pixiv_config, "r18_mode", "过滤 R18"), filters
+        )
+        return [item for item in items
+                if is_r18(item) == (mode == "仅 R18")
+                and not (getattr(self.pixiv_config, "filter_r18g_only", False)
+                         and is_r18g(item))]
+
+    async def _search_novel(self, tags, query, context, filters="safe"):
         import asyncio
+
+        resolve_content_mode(getattr(self.pixiv_config, "r18_mode", "过滤 R18"), filters)
 
         # ID 检查
         if query.isdigit():
@@ -700,6 +721,8 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
                     self.pixiv_client.novel_detail, int(query)
                 )
                 if novel_detail and novel_detail.novel:
+                    if not self._filter_novel_policy([novel_detail.novel], filters):
+                        return "该小说不符合当前内容过滤设置。"
                     event = self._get_event(context)
                     if event:
                         return await self._send_novel_result(
@@ -722,13 +745,16 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
             )
 
             if search_result and search_result.novels:
+                items = self._filter_novel_policy(search_result.novels, filters)
+                if not items:
+                    return "未找到符合当前内容过滤设置的小说。"
                 event = self._get_event(context)
                 if event:
                     return await self._send_novel_result(
-                        event, search_result.novels, query, tags
+                        event, items, query, tags
                     )
                 else:
-                    return self._format_text_results(search_result.novels, query, tags)
+                    return self._format_text_results(items, query, tags)
             else:
                 return f"未找到关于 '{query}' 的小说。"
         except Exception as e:
