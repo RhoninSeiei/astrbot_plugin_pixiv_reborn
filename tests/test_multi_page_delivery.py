@@ -349,16 +349,16 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([component.text for component in details], ["details"])
 
-    async def test_hidden_details_keep_only_work_id_for_reply_lookup(self):
+    async def test_hidden_details_send_image_without_work_id(self):
         results = [result async for result in self.pixiv_utils.send_pixiv_image(
             object(), FakeEvent(), fake_illust(1), "private verbose details",
             show_details=False,
         )]
         texts = [part.text for part in results[0].chain if isinstance(part, FakePlain)]
-        self.assertEqual(texts, ["作品ID: 148023016"])
+        self.assertEqual(texts, [])
         self.assertTrue(any(isinstance(part, FakeImage) for part in results[0].chain))
 
-    async def test_hidden_ugoira_details_keep_work_id_for_reply_lookup(self):
+    async def test_hidden_ugoira_details_send_image_without_work_id(self):
         from unittest.mock import AsyncMock, patch
 
         with patch.object(self.pixiv_utils, "process_ugoira_for_content", AsyncMock(
@@ -371,9 +371,9 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
                 object(), FakeEvent(), illust, "details", show_details=False,
             )]
         texts = [part.text for part in results[0].chain if isinstance(part, FakePlain)]
-        self.assertEqual(texts, [f"作品ID: {illust.id}"])
+        self.assertEqual(texts, [])
 
-    async def test_hidden_forward_nodes_keep_per_work_identity(self):
+    async def test_hidden_forward_nodes_do_not_append_work_ids(self):
         from unittest.mock import AsyncMock, patch
 
         self.pixiv_utils._config.show_details = False
@@ -390,7 +390,7 @@ class MultiPageDeliveryTest(unittest.IsolatedAsyncioTestCase):
             )]
         nodes = results[0].chain[0].nodes
         self.assertEqual([[part.text for part in node.content if isinstance(part, FakePlain)]
-                          for node in nodes], [["作品ID: 11"], ["作品ID: 12"]])
+                          for node in nodes], [[], []])
 
     async def test_ten_pages_yield_three_images_and_one_work_id(self):
         results = await self._collect_delivery(fake_illust(10))
